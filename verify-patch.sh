@@ -5,7 +5,9 @@
 # exactly as expected, BEFORE any build / deploy / first start.
 #   v1: md5 must be 11fc46b9d9eb432e42678503452f5a29 AND ROUTE_FEE_BPS must be 0
 #       (13 Nov local audit patch removed the hidden 0.5% Jupiter referral fee)
-#   v2: md5 must be a1d2906597d4b3ab0e9a0be2e92644f6 AND ROUTE_FEE_BPS must be 50
+#   v2: md5 must be 11fc46b9d9eb432e42678503452f5a29 AND ROUTE_FEE_BPS must be 0
+#       (24 Nov 2026: owner decision, the v2 fee was removed; v2 now uses the
+#       same fee-free file as v1, byte for byte)
 #       AND the dormant Jupiter Ultra path (ultraOrder / ultraOrderParams)
 #       must still have no callers outside swap-route-config.js itself.
 #
@@ -26,8 +28,8 @@
 # ad hoc to make a failing check pass.
 V1_EXPECTED_MD5="11fc46b9d9eb432e42678503452f5a29"
 V1_EXPECTED_BPS="0"
-V2_EXPECTED_MD5="a1d2906597d4b3ab0e9a0be2e92644f6"
-V2_EXPECTED_BPS="50"
+V2_EXPECTED_MD5="11fc46b9d9eb432e42678503452f5a29"
+V2_EXPECTED_BPS="0"
 
 FAIL=0
 

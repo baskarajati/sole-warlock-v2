@@ -153,7 +153,7 @@ function create(opts = {}) {
     ...fileParams,
     ...envParams,
   };
-  if (params.maxFeeBps == null) params.maxFeeBps = bot === 'v2' ? 50 : 0;
+  if (params.maxFeeBps == null) params.maxFeeBps = 0;   // both bots: no route fee (v2 fee removed 24 Nov 2026)
   const derived = {
     k1Sol: params.k1LegLossPct * params.legSol,
     k2Sol: params.k2DrawdownPct * params.bookSol,
