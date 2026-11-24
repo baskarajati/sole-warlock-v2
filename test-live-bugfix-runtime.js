@@ -28,7 +28,7 @@ function world(o = {}) {
     log: (m) => logs.push(m), now: () => new Date().toISOString(), sleep: async () => {},
     telegram: { send: (x) => { tg.push(x); return Promise.resolve(); } },
     saveState: (s) => saves.push(JSON.parse(JSON.stringify(require('./live-positions').persistView(s)))),
-    realSolBal: async () => chain.sol, solUsd: async () => 200,
+    realSolBal: async () => chain.sol, solUsd: async () => 200, solUsdCache: { t: Date.now(), px: 200 },
     jupiterSwapLive: o.jup || (async (a, b, raw) => { chain.tok -= BigInt(raw); chain.sol += Number(raw) / 1e6 * 0.001; return { ok: true, inUi: Number(raw) / 1e6, outUi: Number(raw) / 1e6 * 0.001, sig: 'SWAP' }; }),
     send: async () => {}, Transaction: class { add() { return this; } }, createCloseAccountInstruction: () => ({}),
     slBlacklist: { isStopLoss: () => false, add: () => false }, liveRowBins: () => null, liveNotifyClose: () => {},
@@ -118,6 +118,37 @@ function world(o = {}) {
     const r = await w.ctx.reconcileLive(w.state, { why: 'test' });
     assert.equal(r.full, false); assert.equal(r.adopted, 1); assert.equal(w.state.pendingOpens.length, 0);
     const a = w.state.positions[0]; assert.equal(a.position, posPk.toBase58()); assert.ok(Math.abs(a.depositSol - 0.7) < 1e-9 && Math.abs(a.leftoverSol - 0.3) < 1e-9, 'booked what reached the position; the rest stays its SOL pile');
+  });
+  await t('review fix: a USDC close that throws after the swap-back is resumed WITHOUT selling the SOL pile again (adopted position, walletBefore null)', async () => {
+    const pos = { name: 'AD-USDC', position: Keypair.generate().publicKey.toBase58(), pool: 'P', mintX: SOLM, decX: 6, capitalAsset: 'USDC', quoteMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', depositSol: 50, depositQuote: 50, usdcIn: 60, initialUsdcIn: 60,
+      leftoverSol: 0.05, walletTokenRaw: '0', closeWalletTokenBefore: '0', walletBefore: null, adopted: true,
+      closeStartSol: 1, closePendingReason: 'stop_loss', closeSigs: [], closeEstimate: { pnl: -0.1, value: 45, fees: 0, price: 1 } };
+    const swaps = [];
+    const w = world({ sol: 1.06, tok: 0n, jup: async (a, b, raw) => { swaps.push([a, b, raw]); return { ok: true, inUi: Number(raw) / 1e9, outUi: Number(raw) / 1e9 * 200, sig: 'SW' }; } });
+    let throwOnce = true; w.ctx.slBlacklist.isStopLoss = () => { if (throwOnce) { throwOnce = false; throw new Error('boom after the swaps'); } return false; };   // same spot as the walletBefore crash
+    w.state.positions = [pos]; w.state.position = pos; w.state.__active = pos;
+    await assert.rejects(w.ctx.finishGhostClose(w.state, pos), /boom/);
+    assert.equal(swaps.length, 1, 'pile sold once'); assert.ok(pos.closeSwapBack, 'swap-back result saved before the throw');
+    await w.ctx.finishGhostClose(w.state, pos);
+    assert.equal(swaps.length, 1, 'resumed close must not sell the pile again');
+    const row = w.state.history[0]; assert.ok(row, 'booked'); assert.equal(row.closeSwapBack, undefined); assert.equal(w.state.position, null);
+    assert.ok(w.logs.some(l => /nothing sold again/.test(l)));
+  });
+  await t('review fix: a throw in the halt accounting keeps the close marks (resumable from the saved swap-back, not booked as closed outside)', async () => {
+    const pos = { name: 'HA-USDC', position: Keypair.generate().publicKey.toBase58(), pool: 'P', mintX: SOLM, decX: 6, capitalAsset: 'USDC', quoteMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', depositSol: 50, usdcIn: 60, leftoverSol: 0.05, walletTokenRaw: '0', closeWalletTokenBefore: '0', walletBefore: 1,
+      closeStartSol: 1, closePendingReason: 'take_profit', closeSigs: [], closeEstimate: { pnl: 0.1, value: 55, fees: 0, price: 1 } };
+    const swaps = []; const w = world({ sol: 1.06, jup: async (a, b, raw) => { swaps.push(raw); return { ok: true, inUi: 0, outUi: 1, sig: 'SW' }; } });
+    let once = true; w.ctx.halt.recordClose = () => { if (once) { once = false; throw new Error('halt io'); } return { trips: [] }; };
+    w.state.positions = [pos]; w.state.position = pos; w.state.__active = pos;
+    await assert.rejects(w.ctx.finishGhostClose(w.state, pos), /halt io/);
+    assert.equal(pos.closePendingReason, 'take_profit'); assert.ok(pos.closeSwapBack);
+    await w.ctx.finishGhostClose(w.state, pos); assert.equal(swaps.length, 1); assert.equal(w.state.history.length, 1); assert.equal(w.state.history[0].reason, 'take_profit');
+  });
+  await t('review fix: a USDC position closed outside the bot is booked with usdcOut / pnlUsd estimates', async () => {
+    const pos = { name: 'OUT-USDC', position: 'POSX', pool: 'P', mintX: SOLM, capitalAsset: 'USDC', quoteMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', usdcIn: 100, initialUsdcIn: 100, leftoverSol: 0.1, rentRefundableSol: 0.05, lastValuation: { value: 90, pnl: -0.1, fees: 0 } };
+    const w = world(); w.state.positions = [pos]; w.state.position = pos;
+    await w.ctx.bookClosedOutside(w.state, pos);
+    const row = w.state.history[0]; assert.ok(Math.abs(row.usdcOut - (90 + 0.15 * 200)) < 1e-9); assert.ok(Math.abs(row.pnlUsd - 20) < 1e-9); assert.equal(row.estimated, true);
   });
   console.log(`all ${n} runtime simulations passed`);
 })().catch(e => { console.error(e); process.exit(1); });

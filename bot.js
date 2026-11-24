@@ -2327,7 +2327,7 @@ async function closeSigsLamports(sigs) {
   }
   return sum / LAMPORTS_PER_SOL;
 }
-function clearCloseMarks(pos) { for (const k of ['closeStartSol', 'closePendingReason', 'closeSigs', 'closeEstimate', 'closeWalletTokenBefore', 'closePosTokenRaw', 'closeReceivedSol', 'missingPolls']) delete pos[k]; }
+function clearCloseMarks(pos) { for (const k of ['closeStartSol', 'closePendingReason', 'closeSigs', 'closeEstimate', 'closeWalletTokenBefore', 'closePosTokenRaw', 'closeReceivedSol', 'closeSwapBack', 'missingPolls']) delete pos[k]; }
 // Tokens of this position in the wallet (M1): reshape tokens + what the remove returned. Legacy positions (no walletTokenRaw) keep the old "whole balance" rule.
 async function ownTokenForSale(pos) {
   const accs = await conn.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(pos.mintX) });
@@ -2350,36 +2350,44 @@ async function finishLiveClose(state, pos, reason, opts, v) {
   const receivedSol = pos.closeReceivedSol;
   if (pos.capitalAsset === 'SOL') return liveCloseSol({ state, pos, reason, opts, v, receivedSol });   // SOL capital: token -> SOL only, no USDC leg
   // Swap back exactly like the dry run (paper-usdc.exitQuote): token -> USDC directly, then the position's whole SOL pile -> USDC.
-  let lastTok = null;
-  const sb = await liveCloseExec.swapBack({
-    pos, sleep, log, pileSol: (pos.quoteMint === USDC ? 0 : 0) + Math.max(0, (pos.leftoverSol || 0) + receivedSol),
-    getUsdcBalance: () => liveUsdcBal(wallet.publicKey),
-    getSolBalance: () => realSolBal(wallet.publicKey),
-    getToken: async () => (lastTok = await ownTokenForSale(pos)),
-    swapTokenToUsdc: (raw, dec) => jupiterSwapLive(pos.mintX, USDC, raw, dec, 6, 'token-to-usdc-close'),
-    swapSolToUsdc: raw => jupiterSwapLive(SOL, USDC, raw, 9, 6, 'sol-pile-to-usdc-close'),
-    closeTokenAccounts: closeTokenAccountsIfEmpty,
-    // SWEEP: no other open position shares this mint, so any token left of it is dust from an earlier close and is safe to sell too.
-    canSweepStray: async () => !(livePositions.list(state) || []).some(x => x.mintX === pos.mintX && String(x.position) !== String(pos.position)),
-  });
-  // USDC capital: unsold tokens are retried to USDC (not SOL) and booked meanwhile at the close price - 1% (like the SOL path, M3), corrected when sold.
-  let pendingTokenEstimateUsdc = 0;
-  if (!sb.complete) {
-    log('  ERROR swap back incomplete, leftover stays in the wallet (retried every cycle until sold): ' + sb.errors.join(' | '));
-    const ownedRaw = lastTok ? lastTok.raw : 0n, dec = lastTok ? lastTok.decimals : pos.decX;
-    if (!(sb.tokenSwapped > 0) && ownedRaw > 0n && v.price > 0) { const qUsd = pos.quoteMint === USDC ? 1 : await solUsd().catch(() => 0); pendingTokenEstimateUsdc = Number(ownedRaw) / 10 ** dec * v.price * qUsd * 0.99; }
-    (state.pendingSells = state.pendingSells || []).push({ mint: pos.mintX, dec: pos.decX, name: pos.name, at: now(), to: 'USDC', ...(lastTok && pos.walletTokenRaw != null ? { ownedRaw: String(lastTok.raw) } : {}), row: { position: pos.position, closedAt: null }, estimateUsdc: pendingTokenEstimateUsdc });
+  // Review fix (24 Nov 2026): the swap-back result is saved once (pos.closeSwapBack). Any throw after the swaps (an adopted position
+  // has walletBefore null and the log line threw) left the close pending; the next poll found the account gone, ran this function
+  // again and sold the saved SOL pile a second time from the wallet, every poll. A resumed close now books the saved result.
+  let lastTok = null, sb, pendingTokenEstimateUsdc = 0;
+  if (pos.closeSwapBack) {
+    ({ sb, pendingTokenEstimateUsdc = 0 } = pos.closeSwapBack); sb = { ...sb, errors: [...(sb.errors || [])] };
+    log('  swap-back already done by the interrupted close: booked from the saved result, nothing sold again');
+  } else {
+    sb = await liveCloseExec.swapBack({
+      pos, sleep, log, pileSol: (pos.quoteMint === USDC ? 0 : 0) + Math.max(0, (pos.leftoverSol || 0) + receivedSol),
+      getUsdcBalance: () => liveUsdcBal(wallet.publicKey),
+      getSolBalance: () => realSolBal(wallet.publicKey),
+      getToken: async () => (lastTok = await ownTokenForSale(pos)),
+      swapTokenToUsdc: (raw, dec) => jupiterSwapLive(pos.mintX, USDC, raw, dec, 6, 'token-to-usdc-close'),
+      swapSolToUsdc: raw => jupiterSwapLive(SOL, USDC, raw, 9, 6, 'sol-pile-to-usdc-close'),
+      closeTokenAccounts: closeTokenAccountsIfEmpty,
+      // SWEEP: no other open position shares this mint, so any token left of it is dust from an earlier close and is safe to sell too.
+      canSweepStray: async () => !(livePositions.list(state) || []).some(x => x.mintX === pos.mintX && String(x.position) !== String(pos.position)),
+    });
+    // USDC capital: unsold tokens are retried to USDC (not SOL) and booked meanwhile at the close price - 1% (like the SOL path, M3), corrected when sold.
+    if (!sb.complete) {
+      log('  ERROR swap back incomplete, leftover stays in the wallet (retried every cycle until sold): ' + sb.errors.join(' | '));
+      const ownedRaw = lastTok ? lastTok.raw : 0n, dec = lastTok ? lastTok.decimals : pos.decX;
+      if (!(sb.tokenSwapped > 0) && ownedRaw > 0n && v.price > 0) { const qUsd = pos.quoteMint === USDC ? 1 : await solUsd().catch(() => 0); pendingTokenEstimateUsdc = Number(ownedRaw) / 10 ** dec * v.price * qUsd * 0.99; }
+      (state.pendingSells = state.pendingSells || []).push({ mint: pos.mintX, dec: pos.decX, name: pos.name, at: now(), to: 'USDC', ...(lastTok && pos.walletTokenRaw != null ? { ownedRaw: String(lastTok.raw) } : {}), row: { position: pos.position, closedAt: null }, estimateUsdc: pendingTokenEstimateUsdc });
+    }
+    if (pendingTokenEstimateUsdc > 0) sb.usdcOut += pendingTokenEstimateUsdc;
+    pos.closeSwapBack = { sb, pendingTokenEstimateUsdc }; saveState(state, path.join(DIR, 'state.json'));
   }
-  if (pendingTokenEstimateUsdc > 0) sb.usdcOut += pendingTokenEstimateUsdc;
   const after = await realSolBal(wallet.publicKey);
   const afterUsdc = sb.usdcAfter;
-  const realized = after - pos.walletBefore;
+  const realized = Number.isFinite(pos.walletBefore) ? after - pos.walletBefore : 0;   // adopted positions have no walletBefore
   const basisUsdc = pos.initialUsdcIn || pos.usdcIn, pnlUsd = sb.usdcOut - basisUsdc, pnlPct = basisUsdc > 0 ? 100 * pnlUsd / basisUsdc : 0;   // same definition as paperClose
-  log(`  USDC out ${sb.usdcOut.toFixed(4)} for ${basisUsdc.toFixed(4)} in: ${pnlUsd.toFixed(4)} USDC (${pnlPct.toFixed(3)}%); wallet SOL back to ${after.toFixed(4)} (was ${pos.walletBefore.toFixed(4)} before the position)`);
+  log(`  USDC out ${sb.usdcOut.toFixed(4)} for ${basisUsdc.toFixed(4)} in: ${pnlUsd.toFixed(4)} USDC (${pnlPct.toFixed(3)}%); wallet SOL back to ${after.toFixed(4)} (was ${Number.isFinite(pos.walletBefore) ? pos.walletBefore.toFixed(4) : '?'} before the position)`);
   // SL blacklist: record every stop-loss close by token mint, exactly like paperClose (the rule controls skipping at screening/open).
   if (!opts.intermediate && slBlacklist.isStopLoss(reason)) { try { if (slBlacklist.add(PAPER_DIR, { mint: pos.mintX, symbol: pos.name, pool: pos.pool, reason, closedAt: now(), source: 'auto' })) log('SL blacklist add ' + pos.name + ' ' + pos.mintX); } catch (e) { log('SL blacklist add failed: ' + e.message); } }
-  clearCloseMarks(pos);
   const row = { ...pos, closedAt: now(), reason, estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +realized.toFixed(5), usdcIn: basisUsdc, usdcOut: sb.usdcOut, legUsdcIn: pos.usdcIn, legUsdcOut: sb.usdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, pnlCapital: pnlUsd, pnlCapitalPct: pnlPct, solPile: sb.solPile, swapBackComplete: sb.complete, swapBackErrors: sb.errors };
+  clearCloseMarks(row);
   // Item 1 (§3.1.7 + K1/K3-K8): flag on-chain-estimate exits in the row
   // (liveNotifyClose below renders the row, so the flag reaches the alert)
   // and feed the close into the halt accounting. Intermediate reposition
@@ -2413,6 +2421,8 @@ async function finishLiveClose(state, pos, reason, opts, v) {
       : { quotedSol: null, realisedSol: null };
     halt.recordClose({ pnlSol: pxHalt > 0 ? pnlUsd / pxHalt : 0, legSol: pxHalt > 0 ? (pos.quoteMint === USDC ? (pos.depositQuote ?? pos.usdcIn ?? 0) / pxHalt : (pos.depositSol || 0)) : undefined, reason, pool: pos.pool, openedAt: pos.openedAt, quotedSol: gap.quotedSol, realisedSol: gap.realisedSol, feeBps: swapRoute.ROUTE_FEE_BPS });
   }
+  // Review fix: the close marks (incl. the saved swap-back result) are cleared only now, so a throw above leaves the close resumable.
+  clearCloseMarks(pos);
   row.binShape = liveRowBins(pos); delete row.liveBins;   // closed rows keep the compact snapshot (PnL card bins), not the live chart model
   if (pendingTokenEstimateUsdc > 0) { row.pendingTokenEstimateUsdc = pendingTokenEstimateUsdc; row.swapBackEstimated = true; const ps = state.pendingSells[state.pendingSells.length - 1]; if (ps && ps.row) ps.row.closedAt = row.closedAt; }
   if (!opts.intermediate) { state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json')); }
@@ -2653,6 +2663,13 @@ async function bookClosedOutside(state, pos) {
     const capIn = pos.capitalInSol, basisSol = pos.initialCapitalInSol || capIn, solOut = Math.max(0, (pos.leftoverSol || 0) + (Number(lv.value) || 0) + (pos.rentRefundableSol || 0));
     const pnlCapital = solOut - capIn + (pos.realizedPnlCarrySol || 0), pnlPct = basisSol > 0 ? 100 * pnlCapital / basisSol : 0;
     Object.assign(row, { solOut, solPile: solOut, realizedSol: +(solOut - capIn).toFixed(5), pnlCapital, pnlCapitalPct: pnlPct, pnlPct, netPnlPct: pnlPct, netPnlSol: pnlCapital, solUsd: px, pnlUsd: pnlCapital * px, netPnlUsd: pnlCapital * px });
+  } else {
+    // Review fix (24 Nov 2026): USDC capital had no result fields (usdcOut / pnlUsd), so stats read the row as a zero trade. Estimate:
+    // last value (quote USDC, or SOL at the SOL price) + the position's SOL pile and refundable rent at the SOL price.
+    const quoteUsd = pos.quoteMint === USDC ? 1 : px, basisUsdc = pos.initialUsdcIn || pos.usdcIn || 0;
+    const usdcOut = (Number(lv.value) || 0) * quoteUsd + ((pos.leftoverSol || 0) + (pos.rentRefundableSol || 0)) * px;
+    const pnlUsd = usdcOut - basisUsdc, pnlPct = basisUsdc > 0 ? 100 * pnlUsd / basisUsdc : 0;
+    Object.assign(row, { usdcIn: basisUsdc, usdcOut, legUsdcOut: usdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, pnlCapital: pnlUsd, pnlCapitalPct: pnlPct, solUsd: px });
   }
   clearCloseMarks(row); delete row.liveBins;
   state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json'));
