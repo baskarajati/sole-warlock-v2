@@ -127,6 +127,34 @@ function freshState() {
   };
 }
 
+// Shape of each threshold: 'frac' = (0, 1], 'count' = integer >= 1, 'pos' = > 0, 'bps' = integer >= 0.
+const PARAM_KIND = Object.freeze({
+  bookSol: 'pos', legSol: 'pos', k1LegLossPct: 'frac', k2DrawdownPct: 'frac', k3ConsecEmergency: 'count',
+  k4ConsecLosses: 'count', k4LossSumPct: 'frac', k5Worst3Pct: 'frac', k6NetPct: 'frac', k6MinLegs: 'count',
+  k6WindowDays: 'pos', dailyLossPct: 'frac', k7MaxBreaches: 'count', k8GapSol: 'pos', k8GapConsec: 'count',
+  maxFeeBps: 'bps', feedStalePolls: 'count', feedDegradedPolls: 'count', pollSec: 'pos', reshapeMax: 'count',
+});
+function paramOk(kind, n) {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return false;
+  if (kind === 'frac') return n > 0 && n <= 1;
+  if (kind === 'count') return Number.isInteger(n) && n >= 1;
+  if (kind === 'bps') return Number.isInteger(n) && n >= 0;
+  return n > 0;
+}
+// Mutates params: coerces numeric strings, replaces every bad value with its safe default. Returns the problems found.
+function validateParams(params) {
+  const problems = [];
+  for (const [k, kind] of Object.entries(PARAM_KIND)) {
+    const raw = params[k];
+    const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+    if (paramOk(kind, n)) { params[k] = n; continue; }
+    const fallback = k === 'maxFeeBps' ? 0 : DEFAULT_PARAMS[k];
+    problems.push(`${k}=${JSON.stringify(raw)} is not a valid ${kind} value; using ${fallback}`);
+    params[k] = fallback;
+  }
+  return problems;
+}
+
 function create(opts = {}) {
   const dir = opts.dir || process.cwd();
   const log = opts.log || (() => {});
@@ -153,7 +181,12 @@ function create(opts = {}) {
     ...fileParams,
     ...envParams,
   };
-  if (params.maxFeeBps == null) params.maxFeeBps = bot === 'v2' ? 50 : 0;
+  if (params.maxFeeBps == null) params.maxFeeBps = 0;   // both bots: no route fee (v2 fee removed 24 Nov 2026)
+  // Review fix (24 Nov 2026): every threshold must be a real number. A typo such as "15%" used to give NaN, and every
+  // compare with NaN is false, so that halt could never trip (K2 let a 90% drawdown through). A bad value now falls back to
+  // the D-0c default for that key (the halt stays armed), is logged, and is sent as an alert once the module is up.
+  const paramProblems = validateParams(params);
+  for (const pr of paramProblems) log(`halt params: ${pr}`);
   const derived = {
     k1Sol: params.k1LegLossPct * params.legSol,
     k2Sol: params.k2DrawdownPct * params.bookSol,
@@ -184,6 +217,7 @@ function create(opts = {}) {
       alert('halt-state-corrupt', `${stateFile}: unparseable (${e.message}) — accounting restarted from zero; no halt action taken`, 'INFO');
     }
   }
+  if (paramProblems.length) alert('halt-params-invalid', paramProblems.join('; '), 'INFO');
   // The HALT file is the durable latch: if it exists but state was lost,
   // re-latch from it (a restart must never auto-clear a halt — C11).
   if (!state.tripped && fs.existsSync(haltFile)) {
@@ -215,7 +249,9 @@ function create(opts = {}) {
     // claim opens are refused. Every other action keeps its wording.
     const text =
       `HALT ${criterion}: ${figures} — action ${action}. ` +
-      (action === 'INFO'
+      (action === 'INFO' && criterion === 'halt-params-invalid'
+        ? 'Alert only: the bad value was replaced by its safe default, the halt stays armed. Fix halt-params.json / HALT_* and restart.'
+        : action === 'INFO'
         ? 'Alert only: no halt action taken, opens are NOT refused. Accounting history may have restarted from zero — check halt-state.json before trusting K2/K6/K7 figures.'
         : action === 'STOP'
           ? 'Pilot killed: new opens refused (latched). Open positions unwind through the normal close path; process exits once flat. Manual reset only (sole removes HALT + STOP after review).'
@@ -551,4 +587,4 @@ function create(opts = {}) {
   };
 }
 
-module.exports = { create, DEFAULT_PARAMS, cetDayString };
+module.exports = { validateParams, create, DEFAULT_PARAMS, cetDayString };

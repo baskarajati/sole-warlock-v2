@@ -25,7 +25,7 @@ const DEFAULTS = Object.freeze({
   MIN_LIQ_USD: 10000,
   MIN_AGE_H: 0.5,
   RESHAPE_N: 5,
-  RESHAPE_MAX: null,  // null = unlimited (author behaviour); a positive integer freezes reshaping per position at that count (Warlock v1 Book E = 5)
+  RESHAPE_MAX: 5,  // Item 1 (closes OPEN-3): was null (= unlimited, author behaviour). The 23 Nov port set the FIELDS default to 5 but left DEFAULTS null, so currentValues() returned null on any install whose settings.json does not set the key — the paper freeze gate never fired there. Default is now 5, matching the FIELDS default and the D-0c table; settings.json still wins.
   MIN_BIN_STEP: 80,
   MAX_BIN_STEP: 400,
   UPPER_BUFFER_BINS: 0,

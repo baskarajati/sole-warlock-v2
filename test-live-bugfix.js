@@ -40,8 +40,9 @@ const fnBody = (name) => { const i = src.indexOf(name); assert.ok(i >= 0, name);
   await t('H1 isAccountMissing recognises SDK / RPC "missing" errors only', () => { assert.ok(S.isAccountMissing(new Error('Account does not exist 7xKX'))); assert.ok(!S.isAccountMissing(new Error('429 Too Many Requests'))); });
   // ---------- H2 ----------
   await t('H2 send(): status-poll RPC errors keep polling (no false "not sent"); signature handed to the caller before confirmation', () => {
-    const c = fnBody('async function send(');
-    assert.ok(/opts\.onSig/.test(c)); assert.ok(/catch \(e\) \{[^\n]*\n[^\n]*180_000/.test(c)); assert.ok(/err\.sig = sig/.test(c));
+    const c = fnBody('async function send('), loop = fnBody('async function confirmRaw(');   // review fix: the loop moved to confirmRaw (shared with the Jupiter swaps)
+    assert.ok(/opts\.onSig/.test(c)); assert.ok(/await confirmRaw\(raw, sig, label, lastValidBlockHeight\)/.test(c));
+    assert.ok(/catch \(e\) \{[^\n]*\n[^\n]*180_000/.test(loop)); assert.ok(/err\.sig = sig/.test(loop));
   });
   await t('H2 open: planned position kept in state.pendingOpens before the first send; an error with the account on chain is recorded and booked', () => {
     const c = fnBody('async function openDepositTracked');
@@ -143,12 +144,12 @@ const fnBody = (name) => { const i = src.indexOf(name); assert.ok(i >= 0, name);
     const c = src.slice(src.indexOf('M6 (live-bugfix)'), src.indexOf('Supervised live test')); assert.ok(/plan\.slippageBps/.test(c) && !/3000\)/.test(c)); assert.ok(/ps\.ownedRaw/.test(c));
   });
   // ---------- M7 ----------
-  await t('M7 DLMM instance cached per pool (refreshed before tx building); fee-account lookup cached, RPC errors never cached', async () => {
+  await t('M7 DLMM instance cached per pool (refreshed before tx building); no fee-account lookup (fee removed)', async () => {
     assert.ok(/const dlmm = await dlmmFor\(pos\.pool\);/.test(fnBody('async function liveValuation'))); assert.ok(/dlmmFor\(p\.address, \{ fresh: true \}\)/.test(fnBody('async function liveOpen(')));
-    let calls = 0, fail = true; const conn = { getMultipleAccountsInfo: async (keys) => { calls++; if (fail) throw new Error('429'); return keys.map(() => null); } };
+    // fee removed (24 Nov 2026): no fee-account lookup at all, so no RPC call is made
+    let calls = 0; const conn = { getMultipleAccountsInfo: async () => { calls++; return []; } };
     const so = 'So11111111111111111111111111111111111111112', mint = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-    assert.deepEqual(await SR.swapFeeParams(conn, mint, so), {}); assert.deepEqual(await SR.swapFeeParams(conn, mint, so), {}); assert.equal(calls, 2, 'error not cached');
-    fail = false; await SR.swapFeeParams(conn, mint, so); await SR.swapFeeParams(conn, mint, so); assert.equal(calls, 3, 'answer cached');
+    assert.deepEqual(await SR.swapFeeParams(conn, mint, so), {}); assert.equal(calls, 0, 'no fee lookup');
     const c = S.ttlCache(50, 2); c.set('a', 1); assert.equal(c.get('a'), 1); await new Promise(r => setTimeout(r, 60)); assert.equal(c.get('a'), undefined);
   });
   // ---------- M8 ----------

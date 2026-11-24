@@ -295,9 +295,13 @@ async function run() {
         const r = await httpReq(p2, 'GET', '/api/wallet', null, hdr(STRANGER));
         assert.ok(r.status === 401 || r.status === 403);
       }
-      const locked = await httpReq(p2, 'GET', '/api/wallet', null, hdr(TUAN));
+      // Review fix: the lock blocks every caller whose initData does not validate, but a valid owner HMAC still gets in,
+      // so a stranger who knows the tunnel URL cannot lock the owner out of STOP / close during live.
+      const locked = await httpReq(p2, 'GET', '/api/wallet', null, hdr(STRANGER));
       assert.ok(locked.status === 401 || locked.status === 403);
-      assert.ok(locked.json.reason === 'locked out' || locked.json.locked === true || locked.json.reason);
+      assert.strictEqual(locked.json.reason, 'locked out');
+      const owner = await httpReq(p2, 'GET', '/api/wallet', null, hdr(TUAN));
+      assert.strictEqual(owner.status, 200, owner.raw);
     } finally {
       await new Promise((r) => s2.close(r));
     }

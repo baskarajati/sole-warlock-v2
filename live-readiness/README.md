@@ -1,5 +1,14 @@
 # System-readiness Phase 1 — review branch (v2)
 
+> **Install status — `fix/live-readiness` branch (24 Nov 2026, review fix).**
+> The Item 1 wiring is now APPLIED in the tree (`bot.js`, `live-reshape-exec.js`,
+> `paper-settings.js`). Do not apply the patches again. The creation patches for
+> `live-halt.js` and `halt-params.json` were removed: these files were already in
+> the tree, and `patch` appended a second copy (exit 0), so `live-halt.js` failed
+> with `SyntaxError: Identifier 'fs' has already been declared`. `maxFeeBps` is 0
+> for both bots (v2 fee removed). The Item 1 <-> Item 4a `bot.js` hand-merge (N3)
+> is still open: the Item 4a diffs were not applied.
+
 Snapshot of the Warlock live system-readiness **Phase 1** code (2026-11-24) for
 independent bug review by sole's Claude. Branched from `main`
 @ `ef66daa0f0cb2e5ee53bc4a669a305cce0dbf4e1`. `main` is untouched; nothing here

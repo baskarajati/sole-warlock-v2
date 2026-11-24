@@ -61,8 +61,13 @@ const paperReconcile=require('./paper-reconcile');
 const slBlacklist=require('./paper-sl-blacklist');
 const walletStore = require('./wallet-store');
 const liveControl = require('./live-control');
+const liveHalt = require('./live-halt');   // Item 1: per-book safety-halt enforcement (K1-K8, latch, feed rules)
 
 const DIR = process.env.LP_BOT_DIR || '/workspace/lp-bot';
+// Item 1 (halt): one instance per process. Reads thresholds from
+// <DIR>/halt-params.json (D-0c table) when present, else D-0c Rev 1 defaults.
+// v2 referral fee removed 24 Nov 2026: maxFeeBps 0, a restored fee trips K8.
+const halt = liveHalt.create({ dir: DIR, bot: 'v2', log, notifyEmergency: (rec) => telegram.notifyEmergency(rec), maxFeeBps: 0 });
 const PAPER_DIR = path.join(DIR, 'paper');
 const historyArchivePolicy=entryPolicy.readArchivePolicy(PAPER_DIR);
 let lastArchiveCount=-1;
@@ -125,6 +130,7 @@ const CFG = {
   MAX_DEV_HOLD: +(process.env.MAX_DEV_HOLD || 0.10),
   // Live reshape remains opt-in (RESHAPE=1). Paper always runs the shadow variant set below.
   RESHAPE: process.env.RESHAPE === '1',
+  RESHAPE_MAX: +(process.env.RESHAPE_MAX || 5),   // Item 1: per-leg reshape cap (closes OPEN-3); settings.json wins via applyPaperSettings
   PAPER_VIRTUAL_SOL: +(process.env.PAPER_VIRTUAL_SOL || 5.30),
   PAPER_USDC: +(process.env.PAPER_USDC || paperCap.DEFAULT_USDC_START),
   USDC_BUFFER: +(process.env.USDC_BUFFER || paperCap.DEFAULT_USDC_BUFFER),
@@ -233,19 +239,33 @@ async function realSolBal(pk = (REAL_WALLET ? USER_PUB : null)) {
 }
 
 let solUsdCache = { t: 0, px: 0 };
-async function solUsd() {
+// Review fix (24 Nov 2026): a third source (a Jupiter 1 SOL -> USDC quote, the same API the swaps use) and an age limit.
+// The cache used to return the last price forever. Opens now need a price at most SOL_USD_OPEN_MAX_AGE_MS old
+// (fresh: true); exits may still use an older price (an old price is better than no emergency stop), with a warning.
+const SOL_USD_OPEN_MAX_AGE_MS = 10 * 60_000;
+let solUsdStaleLogAt = 0;
+async function solUsd({ fresh = false } = {}) {
   if (Date.now() - solUsdCache.t < 60_000 && solUsdCache.px) return solUsdCache.px;
   try {
     const j = await getJSON('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {}, 2);
     const px = +j?.solana?.usd;
-    if (px > 0) { solUsdCache = { t: Date.now(), px }; return px; }
+    if (px > 0) { solUsdCache = { t: Date.now(), px }; halt.noteSolUsdAt(Date.now(), px); return px; }   // Item 1: feed freshness for the stale-feed rule + last-good price for the N1 conversion / N2 close fallback
   } catch (e) { log('coingecko sol usd: ' + e.message); }
   try {
     const j = await getJSON('https://api.dexscreener.com/latest/dex/tokens/' + SOL, {}, 2);
     const px = +(j?.pairs?.[0]?.priceUsd || 0);
-    if (px > 0) { solUsdCache = { t: Date.now(), px }; return px; }
+    if (px > 0) { solUsdCache = { t: Date.now(), px }; halt.noteSolUsdAt(Date.now(), px); return px; }   // Item 1: feed freshness for the stale-feed rule + last-good price for the N1 conversion / N2 close fallback
   } catch (e) { log('dexscreener sol usd: ' + e.message); }
-  return solUsdCache.px || 0;
+  try {
+    const q = await jupiterQuote(SOL, USDC, 1_000_000_000n, 9, 6);
+    const px = q && q.ok ? +q.outUi : 0;
+    if (px > 0) { solUsdCache = { t: Date.now(), px }; halt.noteSolUsdAt(Date.now(), px); return px; }   // Item 1: feed freshness for the stale-feed rule + last-good price for the N1 conversion / N2 close fallback
+  } catch (e) { log('jupiter sol usd: ' + e.message); }
+  const age = Date.now() - solUsdCache.t;
+  if (!solUsdCache.px) return 0;
+  if (fresh && age > SOL_USD_OPEN_MAX_AGE_MS) { log(`sol usd: all sources failed, last price is ${Math.round(age / 60000)} min old: not used for an open`); return 0; }
+  if (Date.now() - solUsdStaleLogAt > 5 * 60_000) { solUsdStaleLogAt = Date.now(); log(`WARN sol usd: all sources failed, using the last price ${solUsdCache.px} (${Math.round(age / 60000)} min old)`); }
+  return solUsdCache.px;
 }
 
 async function targetPositionSol(poolTvlUsd) {
@@ -1916,6 +1936,14 @@ async function send(tx, signers, label, opts = {}) {
   const raw = tx.serialize();
   const sig = await conn.sendRawTransaction(raw, { maxRetries: 5 });
   if (typeof opts.onSig === 'function') { try { await opts.onSig(sig); } catch { /* bookkeeping hook must never break the send */ } }   // H1/M2: the caller records the signature before confirmation
+  await confirmRaw(raw, sig, label, lastValidBlockHeight);
+  log(`  tx ${label} confirmed ${sig}`);
+  return sig;
+}
+// Review fix (24 Nov 2026): the confirm loop of send(), shared with the Jupiter swaps (they used a single confirmTransaction, so a
+// swap could land and still throw, and a retry then swapped the same SOL again). Throws err.sig on expiry, err.sig + err.unknownStatus
+// when the status cannot be read, err.sig + err.failedOnChain when the transaction landed with an error (nothing moved).
+async function confirmRaw(raw, sig, label, lastValidBlockHeight) {
   // Keep re-broadcasting the SAME signed transaction every ~1.5 s until it is confirmed or its blockhash expires: a single send is often dropped under load (that is what produced 'block height exceeded').
   const t0 = Date.now();
   for (;;) {
@@ -1925,7 +1953,7 @@ async function send(tx, signers, label, opts = {}) {
       if (Date.now() - t0 > 180_000) { const err = new Error(`${label}: status of ${sig} unknown after 180 s (${e.message})`); err.sig = sig; err.unknownStatus = true; throw err; }
       await sleep(2000); continue;
     }
-    if (st && st.err) throw new Error(`${label} failed ${sig} ${JSON.stringify(st.err)}`);
+    if (st && st.err) { const err = new Error(`${label} failed ${sig} ${JSON.stringify(st.err)}`); err.sig = sig; err.failedOnChain = true; throw err; }
     if (st && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) break;
     let bh = 0; try { bh = await conn.getBlockHeight('confirmed'); } catch { /* ignore */ }
     if (bh > lastValidBlockHeight) { const st2 = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0]; if (st2 && !st2.err && st2.confirmationStatus) break; const err = new Error(`Signature ${sig} has expired: block height exceeded.`); err.sig = sig; throw err; }
@@ -1933,7 +1961,6 @@ async function send(tx, signers, label, opts = {}) {
     try { await conn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }); } catch { /* already known / dropped: keep trying */ }
     await sleep(1500);
   }
-  log(`  tx ${label} confirmed ${sig}`);
   return sig;
 }
 
@@ -2019,6 +2046,17 @@ async function openDepositTracked({ state, p, posKp, recordPosition, args }) {
 async function liveOpen(p, state, opts = {}) {
   // Same open-time guards as the dry run (paperOpenSingle / paperOpenUsdc); nothing has been sent yet when any of them rejects.
   const policy = { ...CFG, ...(opts.strategySettings || {}) };   // a reposition keeps the settings the position was opened with, like paperOpenSingle
+  // Item 1 (halt): THE choke point. Every open route — scan cycle, manual
+  // open (liveManualOpen), reposition openNew — funnels through liveOpen(),
+  // so no route bypasses this check. Refuses before any chain call is made.
+  {
+    const gate = halt.checkGate({ paper: CFG.PAPER, dryRun: CFG.DRY_RUN, liveConfirmed: process.env.LIVE_CONFIRMED === '1' });
+    if (!gate.ok) return { skipped: gate.reason };
+    const fee = halt.checkFeeBps(swapRoute.ROUTE_FEE_BPS, 'open');
+    if (!fee.ok) return { skipped: fee.reason };
+    const open = halt.refuseOpen(Date.now(), { scanAt: state.lastScan && state.lastScan.at ? Date.parse(state.lastScan.at) : null, pollSec: CFG.POLL_SEC, stopPresent: fs.existsSync(path.join(DIR, 'STOP')), noNewPresent: fs.existsSync(path.join(DIR, 'NO_NEW')) });
+    if (!open.ok) { log('OPEN ditolak ' + p.name + ': ' + open.reason); return { skipped: open.reason }; }
+  }
   if (opts.source !== 'reposition' && CFG.SL_BLACKLIST_ENABLED !== false && slBlacklist.has(PAPER_DIR, p.token_x?.address)) { log('OPEN ditolak ' + p.name + ': SL blacklist'); return { skipped: 'SL blacklist: token pernah kena stop loss' }; }
   { const why = entryPolicy.cooldownReason(state.history || [], p.address, CFG.REOPEN_COOLDOWN_MIN); if (why) { log('OPEN ditolak ' + p.name + ': ' + why); return { skipped: why }; } }
   if (CFG.MAX_LIQ_USD > 0 && p.tvl > CFG.MAX_LIQ_USD) { const why = `tvl>$${CFG.MAX_LIQ_USD}`; log('OPEN ditolak ' + p.name + ': ' + why); return { skipped: why }; }
@@ -2044,7 +2082,7 @@ async function liveOpen(p, state, opts = {}) {
   catch (e) { log('quoteCreatePosition failed: ' + e.message); }
   const rentRef = (quote.positionCost || 0) + (typeof TOKEN_ACCOUNT_FEE === 'number' ? TOKEN_ACCOUNT_FEE : 0.00203928);
   const rentNon = (quote.binArrayCost || 0) + (quote.bitmapExtensionCost || 0);
-  const px = await solUsd();
+  const px = await solUsd({ fresh: true });   // review fix: never size an open on an old price
   if (!(px > 0)) return { skipped: 'sol usd unavailable' };
   const usdcBal = await liveUsdcBal(wallet.publicKey);
   const solBal = await realSolBal(wallet.publicKey);
@@ -2233,10 +2271,8 @@ async function liveSwapAllToSol(mintX) {
   if (CFG.DRY_RUN || CFG.PAPER || process.env.LIVE_CONFIRMED !== '1') return;
   const s = await jupGetJSON('https://lite-api.jup.ag/swap/v1/swap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ quoteResponse: { ...q, inAmount: String(q.inAmount), outAmount: String(q.outAmount) },   /* parseQuote turned the amounts into numbers: the Jupiter API answers 422 unless they are strings */ ...swapRoute.swapBodyParams(q), userPublicKey: wallet.publicKey.toBase58(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: 'auto' }) });
   const vtx = VersionedTransaction.deserialize(Buffer.from(s.swapTransaction, 'base64')); vtx.sign([wallet]);
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-  const sig = await conn.sendRawTransaction(vtx.serialize(), { maxRetries: 5 });
-  const c = await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
-  if (c.value.err) throw new Error('jupiter swap failed ' + sig); log('  tx jupiter-swap confirmed ' + sig);
+  const sig = await sendSwapTx(vtx, s, 'jupiter-swap');   // review fix: robust confirm (was a single confirmTransaction)
+  if (sig && sig.notLanded) throw new Error('jupiter swap failed ' + sig.sig + ': ' + sig.reason); log('  tx jupiter-swap confirmed ' + sig);
   try {
     for (const a of accs.value) {
       const tx = new Transaction().add(createCloseAccountInstruction(a.pubkey, wallet.publicKey, wallet.publicKey, [], a.account.owner));
@@ -2291,7 +2327,7 @@ async function closeSigsLamports(sigs) {
   }
   return sum / LAMPORTS_PER_SOL;
 }
-function clearCloseMarks(pos) { for (const k of ['closeStartSol', 'closePendingReason', 'closeSigs', 'closeEstimate', 'closeWalletTokenBefore', 'closePosTokenRaw', 'closeReceivedSol', 'missingPolls']) delete pos[k]; }
+function clearCloseMarks(pos) { for (const k of ['closeStartSol', 'closePendingReason', 'closeSigs', 'closeEstimate', 'closeWalletTokenBefore', 'closePosTokenRaw', 'closeReceivedSol', 'closeSwapBack', 'missingPolls']) delete pos[k]; }
 // Tokens of this position in the wallet (M1): reshape tokens + what the remove returned. Legacy positions (no walletTokenRaw) keep the old "whole balance" rule.
 async function ownTokenForSale(pos) {
   const accs = await conn.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(pos.mintX) });
@@ -2314,36 +2350,79 @@ async function finishLiveClose(state, pos, reason, opts, v) {
   const receivedSol = pos.closeReceivedSol;
   if (pos.capitalAsset === 'SOL') return liveCloseSol({ state, pos, reason, opts, v, receivedSol });   // SOL capital: token -> SOL only, no USDC leg
   // Swap back exactly like the dry run (paper-usdc.exitQuote): token -> USDC directly, then the position's whole SOL pile -> USDC.
-  let lastTok = null;
-  const sb = await liveCloseExec.swapBack({
-    pos, sleep, log, pileSol: (pos.quoteMint === USDC ? 0 : 0) + Math.max(0, (pos.leftoverSol || 0) + receivedSol),
-    getUsdcBalance: () => liveUsdcBal(wallet.publicKey),
-    getSolBalance: () => realSolBal(wallet.publicKey),
-    getToken: async () => (lastTok = await ownTokenForSale(pos)),
-    swapTokenToUsdc: (raw, dec) => jupiterSwapLive(pos.mintX, USDC, raw, dec, 6, 'token-to-usdc-close'),
-    swapSolToUsdc: raw => jupiterSwapLive(SOL, USDC, raw, 9, 6, 'sol-pile-to-usdc-close'),
-    closeTokenAccounts: closeTokenAccountsIfEmpty,
-    // SWEEP: no other open position shares this mint, so any token left of it is dust from an earlier close and is safe to sell too.
-    canSweepStray: async () => !(livePositions.list(state) || []).some(x => x.mintX === pos.mintX && String(x.position) !== String(pos.position)),
-  });
-  // USDC capital: unsold tokens are retried to USDC (not SOL) and booked meanwhile at the close price - 1% (like the SOL path, M3), corrected when sold.
-  let pendingTokenEstimateUsdc = 0;
-  if (!sb.complete) {
-    log('  ERROR swap back incomplete, leftover stays in the wallet (retried every cycle until sold): ' + sb.errors.join(' | '));
-    const ownedRaw = lastTok ? lastTok.raw : 0n, dec = lastTok ? lastTok.decimals : pos.decX;
-    if (!(sb.tokenSwapped > 0) && ownedRaw > 0n && v.price > 0) { const qUsd = pos.quoteMint === USDC ? 1 : await solUsd().catch(() => 0); pendingTokenEstimateUsdc = Number(ownedRaw) / 10 ** dec * v.price * qUsd * 0.99; }
-    (state.pendingSells = state.pendingSells || []).push({ mint: pos.mintX, dec: pos.decX, name: pos.name, at: now(), to: 'USDC', ...(lastTok && pos.walletTokenRaw != null ? { ownedRaw: String(lastTok.raw) } : {}), row: { position: pos.position, closedAt: null }, estimateUsdc: pendingTokenEstimateUsdc });
+  // Review fix (24 Nov 2026): the swap-back result is saved once (pos.closeSwapBack). Any throw after the swaps (an adopted position
+  // has walletBefore null and the log line threw) left the close pending; the next poll found the account gone, ran this function
+  // again and sold the saved SOL pile a second time from the wallet, every poll. A resumed close now books the saved result.
+  let lastTok = null, sb, pendingTokenEstimateUsdc = 0;
+  if (pos.closeSwapBack) {
+    ({ sb, pendingTokenEstimateUsdc = 0 } = pos.closeSwapBack); sb = { ...sb, errors: [...(sb.errors || [])] };
+    log('  swap-back already done by the interrupted close: booked from the saved result, nothing sold again');
+  } else {
+    sb = await liveCloseExec.swapBack({
+      pos, sleep, log, pileSol: (pos.quoteMint === USDC ? 0 : 0) + Math.max(0, (pos.leftoverSol || 0) + receivedSol),
+      getUsdcBalance: () => liveUsdcBal(wallet.publicKey),
+      getSolBalance: () => realSolBal(wallet.publicKey),
+      getToken: async () => (lastTok = await ownTokenForSale(pos)),
+      swapTokenToUsdc: (raw, dec) => jupiterSwapLive(pos.mintX, USDC, raw, dec, 6, 'token-to-usdc-close'),
+      swapSolToUsdc: raw => jupiterSwapLive(SOL, USDC, raw, 9, 6, 'sol-pile-to-usdc-close'),
+      closeTokenAccounts: closeTokenAccountsIfEmpty,
+      // SWEEP: no other open position shares this mint, so any token left of it is dust from an earlier close and is safe to sell too.
+      canSweepStray: async () => !(livePositions.list(state) || []).some(x => x.mintX === pos.mintX && String(x.position) !== String(pos.position)),
+    });
+    // USDC capital: unsold tokens are retried to USDC (not SOL) and booked meanwhile at the close price - 1% (like the SOL path, M3), corrected when sold.
+    if (!sb.complete) {
+      log('  ERROR swap back incomplete, leftover stays in the wallet (retried every cycle until sold): ' + sb.errors.join(' | '));
+      const ownedRaw = lastTok ? lastTok.raw : 0n, dec = lastTok ? lastTok.decimals : pos.decX;
+      if (!(sb.tokenSwapped > 0) && ownedRaw > 0n && v.price > 0) { const qUsd = pos.quoteMint === USDC ? 1 : await solUsd().catch(() => 0); pendingTokenEstimateUsdc = Number(ownedRaw) / 10 ** dec * v.price * qUsd * 0.99; }
+      (state.pendingSells = state.pendingSells || []).push({ mint: pos.mintX, dec: pos.decX, name: pos.name, at: now(), to: 'USDC', ...(lastTok && pos.walletTokenRaw != null ? { ownedRaw: String(lastTok.raw) } : {}), row: { position: pos.position, closedAt: null }, estimateUsdc: pendingTokenEstimateUsdc });
+    }
+    if (pendingTokenEstimateUsdc > 0) sb.usdcOut += pendingTokenEstimateUsdc;
+    pos.closeSwapBack = { sb, pendingTokenEstimateUsdc }; saveState(state, path.join(DIR, 'state.json'));
   }
-  if (pendingTokenEstimateUsdc > 0) sb.usdcOut += pendingTokenEstimateUsdc;
   const after = await realSolBal(wallet.publicKey);
   const afterUsdc = sb.usdcAfter;
-  const realized = after - pos.walletBefore;
+  const realized = Number.isFinite(pos.walletBefore) ? after - pos.walletBefore : 0;   // adopted positions have no walletBefore
   const basisUsdc = pos.initialUsdcIn || pos.usdcIn, pnlUsd = sb.usdcOut - basisUsdc, pnlPct = basisUsdc > 0 ? 100 * pnlUsd / basisUsdc : 0;   // same definition as paperClose
-  log(`  USDC out ${sb.usdcOut.toFixed(4)} for ${basisUsdc.toFixed(4)} in: ${pnlUsd.toFixed(4)} USDC (${pnlPct.toFixed(3)}%); wallet SOL back to ${after.toFixed(4)} (was ${pos.walletBefore.toFixed(4)} before the position)`);
+  log(`  USDC out ${sb.usdcOut.toFixed(4)} for ${basisUsdc.toFixed(4)} in: ${pnlUsd.toFixed(4)} USDC (${pnlPct.toFixed(3)}%); wallet SOL back to ${after.toFixed(4)} (was ${Number.isFinite(pos.walletBefore) ? pos.walletBefore.toFixed(4) : '?'} before the position)`);
   // SL blacklist: record every stop-loss close by token mint, exactly like paperClose (the rule controls skipping at screening/open).
   if (!opts.intermediate && slBlacklist.isStopLoss(reason)) { try { if (slBlacklist.add(PAPER_DIR, { mint: pos.mintX, symbol: pos.name, pool: pos.pool, reason, closedAt: now(), source: 'auto' })) log('SL blacklist add ' + pos.name + ' ' + pos.mintX); } catch (e) { log('SL blacklist add failed: ' + e.message); } }
-  clearCloseMarks(pos);
   const row = { ...pos, closedAt: now(), reason, estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +realized.toFixed(5), usdcIn: basisUsdc, usdcOut: sb.usdcOut, legUsdcIn: pos.usdcIn, legUsdcOut: sb.usdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, pnlCapital: pnlUsd, pnlCapitalPct: pnlPct, solPile: sb.solPile, swapBackComplete: sb.complete, swapBackErrors: sb.errors };
+  clearCloseMarks(row);
+  // Item 1 (§3.1.7 + K1/K3-K8): flag on-chain-estimate exits in the row
+  // (liveNotifyClose below renders the row, so the flag reaches the alert)
+  // and feed the close into the halt accounting. Intermediate reposition
+  // legs are excluded (the final close carries the leg PnL).
+  if (opts.valuation) { row.quoted = !!opts.valuation.quoted; row.valuationBasis = opts.valuation.basis || null; if (!opts.valuation.quoted) log(`  CLOSE ${pos.name}: exit on on-chain estimate (quoted=false, basis=${row.valuationBasis}) — flagged in history row`); }
+  if (!opts.intermediate) {
+    // Item 1 (N2 fix): never skip halt accounting for a missing price.
+    // solUsd() already returns its last-good cached price; if even that
+    // is 0, fall back to the last-good price the halt module remembers
+    // (persisted in halt-state.json, so it survives a restart mid-outage).
+    // Only when no SOL price was ever seen is pnlSol booked as 0 — the
+    // leg is still counted (closedLegs / K3 / K4 / K5 / K7 all see it)
+    // and the row is flagged priceFallback. A price older than the 60 s
+    // solUsd cache window is flagged too.
+    // Item 1 (N3 fix): realisedSol must be the USDC actually realised
+    // FROM THE POSITION. sb.usdcOut also contains the sale of the
+    // out-of-position SOL pile (leftover gas reserve + refunded rent),
+    // so subtract those pile components — otherwise the K8 gap carries a
+    // systematic positive bias of leftoverSol + rent refund against a
+    // 0.0625 SOL threshold. Close fees inside receivedSol stay in (they
+    // shrink the gap slightly — the safe direction). No gap observation
+    // when the swap-back is incomplete (partial fills — and the
+    // pending-token estimate added to sb.usdcOut — are not a quote-vs-fill
+    // observation) or when no price exists.
+    const pxHalt = (await solUsd().catch(() => 0)) || halt.lastSolUsdPx() || 0;
+    const priceFallback = pxHalt === 0 || (Date.now() - solUsdCache.t >= 60_000);
+    if (priceFallback) { row.priceFallback = true; log(`  CLOSE ${pos.name}: halt accounting on ${pxHalt === 0 ? 'NO SOL/USD price ever seen (pnlSol booked as 0 — leg still counted)' : 'fallback SOL price $' + pxHalt.toFixed(2)} — row flagged priceFallback`); }
+    const pileOutsideSol = (pos.leftoverSol || 0) + (pos.rentRefundableSol || 0);
+    const gap = (pxHalt > 0 && sb.complete)
+      ? { quotedSol: pos.quoteMint === USDC ? v.value / pxHalt : v.value, realisedSol: sb.usdcOut / pxHalt - pileOutsideSol }
+      : { quotedSol: null, realisedSol: null };
+    halt.recordClose({ pnlSol: pxHalt > 0 ? pnlUsd / pxHalt : 0, legSol: pxHalt > 0 ? (pos.quoteMint === USDC ? (pos.depositQuote ?? pos.usdcIn ?? 0) / pxHalt : (pos.depositSol || 0)) : undefined, reason, pool: pos.pool, openedAt: pos.openedAt, quotedSol: gap.quotedSol, realisedSol: gap.realisedSol, feeBps: swapRoute.ROUTE_FEE_BPS });
+  }
+  // Review fix: the close marks (incl. the saved swap-back result) are cleared only now, so a throw above leaves the close resumable.
+  clearCloseMarks(pos);
   row.binShape = liveRowBins(pos); delete row.liveBins;   // closed rows keep the compact snapshot (PnL card bins), not the live chart model
   if (pendingTokenEstimateUsdc > 0) { row.pendingTokenEstimateUsdc = pendingTokenEstimateUsdc; row.swapBackEstimated = true; const ps = state.pendingSells[state.pendingSells.length - 1]; if (ps && ps.row) ps.row.closedAt = row.closedAt; }
   if (!opts.intermediate) { state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json')); }
@@ -2390,6 +2469,29 @@ async function liveCloseSol({ state, pos, reason, opts, v, receivedSol }) {
   if (!opts.intermediate && slBlacklist.isStopLoss(reason)) { try { if (slBlacklist.add(PAPER_DIR, { mint: pos.mintX, symbol: pos.name, pool: pos.pool, reason, closedAt: now(), source: 'auto' })) log('SL blacklist add ' + pos.name + ' ' + pos.mintX); } catch (e) { log('SL blacklist add failed: ' + e.message); } }
   clearCloseMarks(pos);
   const row = { ...pos, closedAt: now(), reason, estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +(solOut - capIn).toFixed(5), capitalAsset: 'SOL', solOut, solUsd: px, usdcIn: basisUsdc, usdcOut: basisUsdc + pnlUsd, legUsdcIn: pos.usdcIn, legUsdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, netPnlSol: pnlCapital, pnlCapital, pnlCapitalPct: pnlPct, solPile: solOut, swapBackComplete: sb.complete, swapBackErrors: sb.errors };
+  // Item 1 (§3.1.7 + K1/K3-K8): SOL-capital path — PnL is natively SOL.
+  if (opts.valuation) { row.quoted = !!opts.valuation.quoted; row.valuationBasis = opts.valuation.basis || null; if (!opts.valuation.quoted) log(`  CLOSE ${pos.name}: exit on on-chain estimate (quoted=false, basis=${row.valuationBasis}) — flagged in history row`); }
+  // Item 1 (N3 fix): solOut is the position's own SOL pile PLUS the
+  // out-of-position pile (leftover gas reserve + refunded rent), while
+  // quotedSol (v.value) is the position only — subtract the pile
+  // components so the K8 gap compares like with like. No gap observation
+  // when the swap-back is incomplete (solOut then contains the
+  // pending-token estimate, not a fill).
+  if (!opts.intermediate) {
+    const pileOutsideSol = (pos.leftoverSol || 0) + (pos.rentRefundableSol || 0);
+    const gap = sb.complete
+      ? { quotedSol: v.value, realisedSol: solOut - pileOutsideSol }
+      : { quotedSol: null, realisedSol: null };
+    halt.recordClose({ pnlSol: pnlCapital, legSol: basisSol, reason, pool: pos.pool, openedAt: pos.openedAt, quotedSol: gap.quotedSol, realisedSol: gap.realisedSol, feeBps: swapRoute.ROUTE_FEE_BPS });
+    // Item 1 (N3): liveCloseSol is only reachable with capitalAsset SOL,
+    // which implies quoteMint SOL (liveOpen sets both together; solMode
+    // rejects non-SOL pools). Assert it here: a mismatch means the
+    // position record is internally inconsistent and the SOL-native gap
+    // above cannot be trusted. Trip K8 (fail-closed) AFTER the close is
+    // counted, so a real K1 on this leg keeps latch priority; the breach
+    // is always in the log line either way.
+    if (pos.quoteMint !== SOL) { log(`  CLOSE ${pos.name}: quoteMint mismatch on the SOL-capital path (capitalAsset=SOL but quoteMint=${pos.quoteMint}) — K8 trip, position record inconsistent`); halt.trip('K8', { quoteMint: String(pos.quoteMint), capitalAsset: 'SOL', pool: pos.pool || null, reason: 'liveCloseSol quoteMint !== SOL' }, 'STOP'); }
+  }
   row.binShape = liveRowBins(pos); delete row.liveBins;   // closed rows keep the compact snapshot (PnL card bins), not the live chart model
   if (pendingTokenEstimateSol > 0) { row.pendingTokenEstimateSol = pendingTokenEstimateSol; row.swapBackEstimated = true; const ps = state.pendingSells[state.pendingSells.length - 1]; if (ps && ps.row) ps.row.closedAt = row.closedAt; }
   if (!opts.intermediate) { state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json')); }
@@ -2483,22 +2585,42 @@ async function writePaperStatus(state, extra = {}) {
 async function liveUsdcBal(pk) {
   const owner = pk || (wallet && wallet.publicKey);
   if (!owner) return 0;
-  try {
-    const accs = await conn.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(USDC) });
-    const raw = accs.value.reduce((s, a) => s + BigInt(a.account.data.parsed.info.tokenAmount.amount), 0n);
-    return Number(raw) / 1e6;
-  } catch (e) {
-    log('usdc balance: ' + e.message);
-    return 0;
-  }
+  // Review fix (24 Nov 2026): an RPC error used to return 0. The close books usdcOut = after - before, so a failed read gave a
+  // false profit (or loss) of the whole wallet USDC, and the halt read that number. Now it retries, then throws: an open is
+  // skipped, a close keeps its pending mark and the swap-back estimates the after-balance from the swap quotes.
+  const accs = await withRetry(() => conn.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(USDC) }), { tries: 3, label: 'usdc balance' });
+  const raw = accs.value.reduce((s, a) => s + BigInt(a.account.data.parsed.info.tokenAmount.amount), 0n);
+  return Number(raw) / 1e6;
 }
 
+// Review fix (24 Nov 2026): send a signed Jupiter swap through the send() confirm loop (re-broadcast + status poll + history check).
+// The blockhash is Jupiter's, so its lastValidBlockHeight comes from the /swap answer; the fetched height is only a fallback (a later
+// height just waits longer, the history check still decides). A failed simulation or an on-chain error is returned as { notLanded }
+// (nothing moved);
+// an unknown status still throws with err.sig, so the caller re-reads the balance before any retry (live-close-exec maybeSent).
+async function sendSwapTx(vtx, swapAnswer, label) {
+  if (CFG.PAPER || CFG.DRY_RUN || process.env.LIVE_CONFIRMED !== '1') throw new Error('sendSwapTx() blocked: paper/dry-run or LIVE_CONFIRMED missing');
+  let lvbh = Number(swapAnswer && swapAnswer.lastValidBlockHeight);
+  if (!(lvbh > 0)) lvbh = (await conn.getLatestBlockhash()).lastValidBlockHeight;
+  const raw = vtx.serialize();
+  const sig = bs58.encode(vtx.signatures[0]);
+  try { await conn.sendRawTransaction(raw, { maxRetries: 5 }); }
+  catch (e) {
+    // A failed simulation (slippage, no funds) means the RPC did not forward the transaction: nothing moved, report it now.
+    if (/simulation failed|preflight/i.test(String(e && e.message))) return { notLanded: true, sig, reason: e.message };
+    log(`  ${label}: first send failed (${e.message}); polling ${sig}`);   // a network error may still have forwarded it
+  }
+  try { await confirmRaw(raw, sig, label, lvbh); }
+  catch (e) { if (e.failedOnChain) return { notLanded: true, sig, reason: e.message }; e.sig = e.sig || sig; throw e; }
+  return sig;
+}
 async function jupiterSwapLive(inputMint, outputMint, rawAmount, inDec, outDec, label, slippageBps = 300) {
   const raw = typeof rawAmount === 'bigint' ? rawAmount : BigInt(Math.max(0, Math.floor(Number(rawAmount) || 0)));
   if (raw === 0n) return { ok: true, skipped: 'zero', inUi: 0, outUi: 0 };
   const q = await jupiterQuote(inputMint, outputMint, raw, inDec, outDec, slippageBps);
   if (!q.ok) return { ok: false, error: q.error };
   log(`  jupiter ${label}: ${q.inUi} -> ${q.outUi} (quote)`);
+  { const fee = halt.checkFeeBps(swapRoute.ROUTE_FEE_BPS, `swap:${label}`); if (!fee.ok) return { ok: false, error: fee.reason }; }   // Item 1 (K8): fee check at execution, before any swap is sent
   if (CFG.DRY_RUN || CFG.PAPER || process.env.LIVE_CONFIRMED !== '1') {
     return { ok: true, dry: true, inUi: q.inUi, outUi: q.outUi, quote: q };
   }
@@ -2516,10 +2638,8 @@ async function jupiterSwapLive(inputMint, outputMint, rawAmount, inDec, outDec, 
   });
   const vtx = VersionedTransaction.deserialize(Buffer.from(s.swapTransaction, 'base64'));
   vtx.sign([wallet]);
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-  const sig = await conn.sendRawTransaction(vtx.serialize(), { maxRetries: 5 });
-  const c = await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
-  if (c.value.err) throw new Error(`${label} swap failed`);
+  const sig = await sendSwapTx(vtx, s, `jupiter-${label}`);
+  if (sig && sig.notLanded) return { ok: false, error: `${label} swap not landed: ${sig.reason}`, sig: sig.sig };   // nothing moved: a retry is safe
   log(`  tx jupiter-${label} confirmed ${sig}`);
   return { ok: true, inUi: q.inUi, outUi: q.outUi, sig };
 }
@@ -2543,6 +2663,13 @@ async function bookClosedOutside(state, pos) {
     const capIn = pos.capitalInSol, basisSol = pos.initialCapitalInSol || capIn, solOut = Math.max(0, (pos.leftoverSol || 0) + (Number(lv.value) || 0) + (pos.rentRefundableSol || 0));
     const pnlCapital = solOut - capIn + (pos.realizedPnlCarrySol || 0), pnlPct = basisSol > 0 ? 100 * pnlCapital / basisSol : 0;
     Object.assign(row, { solOut, solPile: solOut, realizedSol: +(solOut - capIn).toFixed(5), pnlCapital, pnlCapitalPct: pnlPct, pnlPct, netPnlPct: pnlPct, netPnlSol: pnlCapital, solUsd: px, pnlUsd: pnlCapital * px, netPnlUsd: pnlCapital * px });
+  } else {
+    // Review fix (24 Nov 2026): USDC capital had no result fields (usdcOut / pnlUsd), so stats read the row as a zero trade. Estimate:
+    // last value (quote USDC, or SOL at the SOL price) + the position's SOL pile and refundable rent at the SOL price.
+    const quoteUsd = pos.quoteMint === USDC ? 1 : px, basisUsdc = pos.initialUsdcIn || pos.usdcIn || 0;
+    const usdcOut = (Number(lv.value) || 0) * quoteUsd + ((pos.leftoverSol || 0) + (pos.rentRefundableSol || 0)) * px;
+    const pnlUsd = usdcOut - basisUsdc, pnlPct = basisUsdc > 0 ? 100 * pnlUsd / basisUsdc : 0;
+    Object.assign(row, { usdcIn: basisUsdc, usdcOut, legUsdcOut: usdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, pnlCapital: pnlUsd, pnlCapitalPct: pnlPct, solUsd: px });
   }
   clearCloseMarks(row); delete row.liveBins;
   state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json'));
@@ -2565,7 +2692,7 @@ async function livePositionCycle(state, stop) {
   }
   if (v && v.externalCapital) saveState(state, path.join(DIR, 'state.json'));
   const ageH = (Date.now() - Date.parse(state.position.openedAt)) / 3.6e6;
-  const live = { valueSol: +v.value.toFixed(5), pnlSol: +(v.value - state.position.depositSol).toFixed(5), pnlPct: +(v.pnl * 100).toFixed(2), feesSol: +v.fees.toFixed(5), ageH: +ageH.toFixed(2), price: v.price, inRange: v.inRange };
+  const live = { valueSol: +v.value.toFixed(5), pnlSol: +(v.value - state.position.depositSol).toFixed(5), quoteMint: state.position.quoteMint === USDC ? 'USDC' : 'SOL', pnlPct: +(v.pnl * 100).toFixed(2), feesSol: +v.fees.toFixed(5), ageH: +ageH.toFixed(2), price: v.price, inRange: v.inRange };   // Item 1 (N1): quote units of pnlSol — liveCycle converts USDC legs at the SOL price
   state.position.liveBins = liveBinSnapshot(v) || state.position.liveBins; state.position.lastPrice = v.price; state.position.quoteSymbol = state.position.quoteSymbol || (state.position.quoteMint === USDC ? 'USDC' : 'SOL');
   state.position.lastActiveBin = v.activeBinId;   // exitQuotePriority() reads it, like the dry run
   state.position.lastValuation = { value: v.value, pnl: v.pnl, fees: v.fees, price: v.price, at: now() };   // H1: last known value, if the account disappears
@@ -2625,6 +2752,7 @@ async function livePositionCycle(state, stop) {
           saveState(state, path.join(DIR, 'state.json'));
         }
         const trg = pos0.reshapePending ? { due: false } : liveReshapeExec.trigger({ pos: pos0, activeBinId: v.activeBinId, settings: pol, stop });   // never start a new reshape on top of an unfinished re-add
+        if (trg.capped && !pos0.reshapeFreezeLogged) { pos0.reshapeFreezeLogged = true; log(`  reshape FROZEN ${pos0.name}: ${pos0.reshapes} reshapes (RESHAPE_MAX=${trg.max}); position stays, -20% backstop live`); }   // Item 1: per-leg cap (closes OPEN-3)
         if (trg.due) {
           const ev = await liveReshapeExec.reshape(rctx);
           pos0.botLiquidityTouched = true;
@@ -2646,7 +2774,7 @@ async function livePositionCycle(state, stop) {
       } catch (e) { log('reshape error (position held, retry next poll): ' + e.message); }
     }
   }
-  if (exitReason) await liveClose(state, exitReason);
+  if (exitReason) await liveClose(state, exitReason, { valuation: decisionVal ? { quoted: !!decisionVal.quoted, basis: decisionVal.valuationBasis || null } : null });   // Item 1: exit-valuation flag for the close row (§3.1.7)
   else saveState(state, path.join(DIR, 'state.json'));   // persist peak / TP-emergency / SL+ state exactly like the dry run
   return live;
 }
@@ -2821,6 +2949,31 @@ async function liveCycle(state) {
     log('NO_NEW present: not opening a new live position (existing holds would still be managed)');
     await writeLiveStatusPointer(state, { noNew: true });
     return false;
+  }
+  // Item 1 (halt): once per cycle, before any open (scan or manual).
+  // Feed check first (a stale feed writes NO_NEW after 3 stale polls);
+  // then K2 drawdown and the K6 7-day branch, evaluated with open
+  // unrealised PnL included. A trip writes STOP and refuses opens from
+  // here on (latched).
+  // N1 fix: lives[].pnlSol is in QUOTE units per leg (SOL for SOL pools,
+  // USDC for USDC pools). halt.openUnrealisedSol() converts USDC legs at
+  // the SOL price (fresh solUsd(), else the last-good price the halt
+  // module remembers) — summing it raw would false-trip K2 on a -$1 USDC
+  // wobble and mask real drawdown on a USDC win. If no price exists at
+  // all, the K2/K6 verdict is skipped this poll (logged); the liveOpen
+  // gate (latch / STOP / NO_NEW / feed) still applies to every open.
+  {
+    const feed = halt.checkFeed(Date.now(), { scanAt: scan.last ? scan.last.at : null, pollSec: CFG.POLL_SEC });
+    if (!feed.ok) log('feed-stale: no new opens this poll');
+    const pxHalt = (await solUsd().catch(() => 0)) || halt.lastSolUsdPx() || 0;
+    const openUnrealised = halt.openUnrealisedSol(lives, pxHalt > 0 ? pxHalt : null);
+    if (openUnrealised == null) {
+      log('HALT K2/K6 skipped this cycle: no SOL/USD price to convert USDC open unrealised');
+    } else {
+      const equity = halt.params().bookSol + halt.status().netSol + openUnrealised;
+      const open = halt.checkOpen(Date.now(), { equitySol: equity, openUnrealisedSol: openUnrealised, scanAt: scan.last ? scan.last.at : null, pollSec: CFG.POLL_SEC });
+      if (!open.ok) { log('HALT refuses opens this cycle: ' + open.reason); await writeLiveStatusPointer(state, { lives, halt: halt.status() }); return false; }
+    }
   }
   if (await liveManualOpen(state, maxPos)) { saveState(state, path.join(DIR, 'state.json')); await writeLiveStatusPointer(state, { lives }); return false; }
   if (state.positions.length >= maxPos) { await writeLiveStatusPointer(state, { lives }); return false; }   // slots full, like the dry run (the test session may lower the limit)
