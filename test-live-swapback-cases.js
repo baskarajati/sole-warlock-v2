@@ -58,5 +58,21 @@ let n = 0; const t = async (name, fn) => { await fn(); n++; console.log('ok', na
     const sw = src.slice(src.indexOf('async function jupiterSwapLive'), src.indexOf('async function finishGhostClose'));
     assert.ok(/\.\.\.swapRoute\.swapBodyParams\(q\)/.test(sw) && /inAmount: String\(q\.inAmount\), outAmount: String\(q\.outAmount\)/.test(sw));
   });
+  await t('review fix: a swap that LANDS but throws (confirm timeout) is not sent again: SOL pile and token', async () => {
+    let sol = 1.0, usdc = 0, tok = 1000n; const calls = [];
+    const f = { pos: { walletBefore: 0.2 }, pileSol: 0.5, sleep: async () => {}, log: () => {}, getUsdcBalance: async () => usdc, getSolBalance: async () => sol,
+      getToken: async () => ({ raw: tok, total: tok, decimals: 6, accounts: [] }), closeTokenAccounts: async () => {},
+      swapTokenToUsdc: async (raw) => { calls.push(['token', raw]); tok -= raw; usdc += 10; throw new Error('Signature x has expired: block height exceeded.'); },
+      swapSolToUsdc: async (raw) => { calls.push(['sol', raw]); sol -= Number(raw) / 1e9; usdc += 75; throw new Error('confirm timeout'); } };
+    const r = await swapBack(f);
+    assert.deepStrictEqual(calls.map(c => c[0]), ['token', 'sol'], 'each swap sent once');
+    assert.ok(r.tokenSwapped > 0 && r.solSwapped > 0); assert.ok(sol > 0.4, 'the other positions keep their SOL');
+  });
+  await t('review fix: a swap that throws and did NOT land is retried with what is still in the wallet', async () => {
+    let sol = 1.0, n = 0; const f = { pos: {}, pileSol: 0.5, sleep: async () => {}, log: () => {}, getUsdcBalance: async () => 0, getSolBalance: async () => sol,
+      getToken: async () => ({ raw: 0n, decimals: 6, accounts: [] }), closeTokenAccounts: async () => {},
+      swapTokenToUsdc: async () => ({ ok: true }), swapSolToUsdc: async (raw) => { n++; if (n === 1) throw new Error('429'); sol -= Number(raw) / 1e9; return { ok: true }; } };
+    const r = await swapBack(f); assert.strictEqual(n, 2); assert.ok(r.solSwapped > 0);
+  });
   console.log('all', n, 'swap-back case tests passed');
 })().catch((e) => { console.error(e); process.exit(1); });

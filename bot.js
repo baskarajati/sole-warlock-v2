@@ -2483,14 +2483,12 @@ async function writePaperStatus(state, extra = {}) {
 async function liveUsdcBal(pk) {
   const owner = pk || (wallet && wallet.publicKey);
   if (!owner) return 0;
-  try {
-    const accs = await conn.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(USDC) });
-    const raw = accs.value.reduce((s, a) => s + BigInt(a.account.data.parsed.info.tokenAmount.amount), 0n);
-    return Number(raw) / 1e6;
-  } catch (e) {
-    log('usdc balance: ' + e.message);
-    return 0;
-  }
+  // Review fix (24 Nov 2026): an RPC error used to return 0. The close books usdcOut = after - before, so a failed read gave a
+  // false profit (or loss) of the whole wallet USDC, and the halt read that number. Now it retries, then throws: an open is
+  // skipped, a close keeps its pending mark and the swap-back estimates the after-balance from the swap quotes.
+  const accs = await withRetry(() => conn.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(USDC) }), { tries: 3, label: 'usdc balance' });
+  const raw = accs.value.reduce((s, a) => s + BigInt(a.account.data.parsed.info.tokenAmount.amount), 0n);
+  return Number(raw) / 1e6;
 }
 
 async function jupiterSwapLive(inputMint, outputMint, rawAmount, inDec, outDec, label, slippageBps = 300) {
