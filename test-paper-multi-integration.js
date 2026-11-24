@@ -43,9 +43,9 @@ for(const quoteMint of [USDC,SOL]){
  await sandbox.fns.paperCycle(st);assert(book.positions[0]);assert.equal(book.positions[0].oorRightPolls,1);await sandbox.fns.paperCycle(st);const rec=book.history[0];
  assert.equal(rec.reason,'oor_right_reposition_limit');assert(Number.isFinite(rec.peakPnlUsd));
  assert.equal(rec.quoteMint,quoteMint);assert.equal(book.positions[0],undefined);assert.equal(book.virtual.sol,0);assert.equal(book.history.length,1);
- // Before the dry run modelled the live route fee (0.5% net quote on every swap leg) cash was 499.985 and PnL -0.015 for both. USDC pool: fee on the gas-buffer + SOL-pile legs (-0.4737); SOL pool under USDC capital: also the whole USDC->SOL entry and SOL->USDC exit (-5.1565, ~1% round trip).
- assert(Math.abs(book.virtual.usdc-(quoteMint===USDC?499.5263:494.8435))<.001,JSON.stringify({quoteMint,cash:book.virtual.usdc,rec}));
- assert(Math.abs(rec.pnlUsd+(quoteMint===USDC?.4737:5.1565))<.001);assert(rec.quoted);
+ // Route fee removed (review 24 Nov 2026): the dry run is fee-free again, as in live. Before the dry run modelled the live route fee (0.5% net quote on every swap leg) cash was 499.985 and PnL -0.015 for both. USDC pool: fee on the gas-buffer + SOL-pile legs (-0.4737); SOL pool under USDC capital: also the whole USDC->SOL entry and SOL->USDC exit (-5.1565, ~1% round trip).
+ assert(Math.abs(book.virtual.usdc-499.985)<.001,JSON.stringify({quoteMint,cash:book.virtual.usdc,rec}));
+ assert(Math.abs(rec.pnlUsd+.015)<.001);assert(rec.quoted);
  if(quoteMint===USDC){assert.equal(rec.feesEarnedSol,null);assert.equal(rec.depositQuote>400,true);}
 }
 // A whole strategy remains ONE trade through two costed right repositions, then mandatory close.
@@ -61,8 +61,8 @@ for(const quoteMint of [USDC,SOL]){
   if(n<=2){assert(book.positions[0],JSON.stringify(book.history));assert.equal(book.positions[0].rightRepositions,n);assert.equal(book.positions[0].maxBinId,activeId+5);assert.equal(book.positions[0].openedAt,originalDate);assert.equal(book.positions[0].initialUsdcIn,initialCost);assert.equal(book.history.length,0);assert(book.positions[0].realizedPnlCarryUsd<0);assert.equal(book.positions[0].openSource,'Auto (bot)');assert.equal(book.positions[0].currentLegOpenContext.source,'Reposition');assert.equal(book.positions[0].entryLegs.length,n);}
  }
  assert.equal(book.positions[0],undefined);assert.equal(book.history.length,1);const rec=book.history[0];
- assert.equal(rec.reason,'oor_right_reposition_limit');assert(Math.abs(rec.pnlUsd-(quoteMint===USDC?-1.4205:-15.3077))<.002,JSON.stringify(rec));assert(Math.abs(book.virtual.usdc-(quoteMint===USDC?498.5795:484.6923))<.002);assert.equal(rec.rightRepositions,2);
- const stats=sandbox.fns.bookStats(book,{id:'N5'},null,100);assert(Math.abs(stats.equityPnlUsd-(quoteMint===USDC?-1.4205:-15.3077))<.002);assert.equal(stats.totalDepositedUsdc,500);
+ assert.equal(rec.reason,'oor_right_reposition_limit');assert(Math.abs(rec.pnlUsd-(quoteMint===USDC?-0.0450:-0.0454))<.002,JSON.stringify(rec));assert(Math.abs(book.virtual.usdc-(quoteMint===USDC?499.9550:499.9546))<.002);assert.equal(rec.rightRepositions,2);
+ const stats=sandbox.fns.bookStats(book,{id:'N5'},null,100);assert(Math.abs(stats.equityPnlUsd-(quoteMint===USDC?-0.0450:-0.0454))<.002);assert.equal(stats.totalDepositedUsdc,500);
 }
 // Approved retry policy: unavailable quotes / failed token purchase do NOT close or debit the old leg.
 for(const quoteMint of [USDC,SOL]){
@@ -148,7 +148,7 @@ for(const quoteMint of [USDC,SOL]){
  command.queue(path.join(temp,'paper'),{type:'close',pool:closedPos.pool,openedAt:closedPos.openedAt,requestId:'multi-close-001',updatedBy:1000000001});
  await sandbox.fns.processPaperRequests(st);assert.equal(st.paperCommands.at(-1).result.ok,true);
  assert.equal(b.positions.length,4);assert.equal(JSON.stringify(b.positions),untouched);
- const afterClose=sandbox.fns.bookStats(b,{id:'N5'},null,100);assert(Math.abs(afterClose.equityPnlUsd+2.8909)<.01);   // was -0.045 before the route fee was modelled (fee on 5 gas-buffer swaps + 1 pile swap)
+ const afterClose=sandbox.fns.bookStats(b,{id:'N5'},null,100);assert(Math.abs(afterClose.equityPnlUsd+0.045)<.01);   // fee-free again (route fee removed, review 24 Nov 2026); was -2.8909 with the fee on 5 gas-buffer swaps + 1 pile swap
  assert.equal((await sandbox.fns.paperOpenAll({...pool(1),address:closedPos.pool,token_x:pool(0).token_x},st)).skipped,'Token (CA) atau pool sudah dibuka');
  // Fixed budgets fail closed when free cash is insufficient (no tiny unintended entry).
  settings.applySettings(path.join(temp,'paper'),{POSITION_USDC:10000});sandbox.fns.applyPaperSettings();

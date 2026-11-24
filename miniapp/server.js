@@ -380,9 +380,12 @@ function createApp(opts = {}) {
   }
 
   function authInit(req, body, { write, maxAgeSec } = {}) {
-    if (locked()) return { ok: false, status: 403, error: 'unauthorized', reason: 'locked out' };
+    // Review fix (24 Nov 2026): the lockout counter is global, so anyone who knows the tunnel URL could send 8 bad requests and
+    // lock the owner out for 15 min (no STOP / close from the mini app during live). A request whose initData carries a valid
+    // owner HMAC (it cannot be forged without the bot token) is now checked BEFORE the lock and is never locked out.
     const v = settings.validateInitData(initDataFrom(req, body), botToken(), { maxAgeSec });
     if (!v.ok) {
+      if (locked()) return { ok: false, status: 403, error: 'unauthorized', reason: 'locked out' };
       noteFail();
       return { ok: false, status: 403, error: 'unauthorized', reason: v.reason };
     }

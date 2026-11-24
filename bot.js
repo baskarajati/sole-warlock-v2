@@ -239,7 +239,12 @@ async function realSolBal(pk = (REAL_WALLET ? USER_PUB : null)) {
 }
 
 let solUsdCache = { t: 0, px: 0 };
-async function solUsd() {
+// Review fix (24 Nov 2026): a third source (a Jupiter 1 SOL -> USDC quote, the same API the swaps use) and an age limit.
+// The cache used to return the last price forever. Opens now need a price at most SOL_USD_OPEN_MAX_AGE_MS old
+// (fresh: true); exits may still use an older price (an old price is better than no emergency stop), with a warning.
+const SOL_USD_OPEN_MAX_AGE_MS = 10 * 60_000;
+let solUsdStaleLogAt = 0;
+async function solUsd({ fresh = false } = {}) {
   if (Date.now() - solUsdCache.t < 60_000 && solUsdCache.px) return solUsdCache.px;
   try {
     const j = await getJSON('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {}, 2);
@@ -251,7 +256,16 @@ async function solUsd() {
     const px = +(j?.pairs?.[0]?.priceUsd || 0);
     if (px > 0) { solUsdCache = { t: Date.now(), px }; halt.noteSolUsdAt(Date.now(), px); return px; }   // Item 1: feed freshness for the stale-feed rule + last-good price for the N1 conversion / N2 close fallback
   } catch (e) { log('dexscreener sol usd: ' + e.message); }
-  return solUsdCache.px || 0;
+  try {
+    const q = await jupiterQuote(SOL, USDC, 1_000_000_000n, 9, 6);
+    const px = q && q.ok ? +q.outUi : 0;
+    if (px > 0) { solUsdCache = { t: Date.now(), px }; halt.noteSolUsdAt(Date.now(), px); return px; }   // Item 1: feed freshness for the stale-feed rule + last-good price for the N1 conversion / N2 close fallback
+  } catch (e) { log('jupiter sol usd: ' + e.message); }
+  const age = Date.now() - solUsdCache.t;
+  if (!solUsdCache.px) return 0;
+  if (fresh && age > SOL_USD_OPEN_MAX_AGE_MS) { log(`sol usd: all sources failed, last price is ${Math.round(age / 60000)} min old: not used for an open`); return 0; }
+  if (Date.now() - solUsdStaleLogAt > 5 * 60_000) { solUsdStaleLogAt = Date.now(); log(`WARN sol usd: all sources failed, using the last price ${solUsdCache.px} (${Math.round(age / 60000)} min old)`); }
+  return solUsdCache.px;
 }
 
 async function targetPositionSol(poolTvlUsd) {
@@ -2061,7 +2075,7 @@ async function liveOpen(p, state, opts = {}) {
   catch (e) { log('quoteCreatePosition failed: ' + e.message); }
   const rentRef = (quote.positionCost || 0) + (typeof TOKEN_ACCOUNT_FEE === 'number' ? TOKEN_ACCOUNT_FEE : 0.00203928);
   const rentNon = (quote.binArrayCost || 0) + (quote.bitmapExtensionCost || 0);
-  const px = await solUsd();
+  const px = await solUsd({ fresh: true });   // review fix: never size an open on an old price
   if (!(px > 0)) return { skipped: 'sol usd unavailable' };
   const usdcBal = await liveUsdcBal(wallet.publicKey);
   const solBal = await realSolBal(wallet.publicKey);
