@@ -1,0 +1,213 @@
+--- pristine-v2/bot.js	2026-11-23 20:47:37.000000000 +0000
++++ patched-v2/bot.js	2026-11-24 16:53:44.525729685 +0000
+@@ -23,6 +23,7 @@
+ const antiPvp = require('./anti-pvp');
+ const feeTurnover = require('./fee-turnover');   // skip small overheated pools (24h fees / TVL)
+ const jup = require('./jupiter-config');   // optional JUPITER_API_KEY -> api.jup.ag (own rate limit); keyless -> lite-api (shared, many 429)
++const feedHealth = require('./feed-health');   // Item 4a: feed-health counters (reporting only; the stale-feed RULES are Item 1)
+ const rugSticky = require('./rug-sticky');   // a token flagged rugged/danger/high score stays blocked even if RugCheck later answers clean
+ const screenReasons = require('./screen-reasons');
+ const tvlDrop = require('./tvl-drop');
+@@ -234,17 +235,18 @@
+ 
+ let solUsdCache = { t: 0, px: 0 };
+ async function solUsd() {
+-  if (Date.now() - solUsdCache.t < 60_000 && solUsdCache.px) return solUsdCache.px;
++  if (Date.now() - solUsdCache.t < 60_000 && solUsdCache.px) { try { feedHealth.recordFreshPrice(); } catch {} return solUsdCache.px; }
+   try {
+     const j = await getJSON('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {}, 2);
+     const px = +j?.solana?.usd;
+-    if (px > 0) { solUsdCache = { t: Date.now(), px }; return px; }
+-  } catch (e) { log('coingecko sol usd: ' + e.message); }
++    if (px > 0) { solUsdCache = { t: Date.now(), px }; try { feedHealth.recordFreshPrice(); } catch {} return px; }
++  } catch (e) { log('coingecko sol usd: ' + e.message); try { if (/429/.test(e.message)) feedHealth.recordCoingecko429(); } catch {} }
+   try {
+     const j = await getJSON('https://api.dexscreener.com/latest/dex/tokens/' + SOL, {}, 2);
+     const px = +(j?.pairs?.[0]?.priceUsd || 0);
+-    if (px > 0) { solUsdCache = { t: Date.now(), px }; return px; }
++    if (px > 0) { solUsdCache = { t: Date.now(), px }; try { feedHealth.recordFreshPrice(); } catch {} return px; }
+   } catch (e) { log('dexscreener sol usd: ' + e.message); }
++  if (solUsdCache.px) { try { feedHealth.recordStalePoll(Date.now() - solUsdCache.t); } catch {} }
+   return solUsdCache.px || 0;
+ }
+ 
+@@ -1632,6 +1634,7 @@
+     const parsed = paperCap.parseQuote(q, inDec, outDec);
+     return Object.assign(q, parsed);
+   } catch (e) {
++    try { if (/429/.test(e.message)) feedHealth.recordJupiter429(); } catch {}   // Item 4a
+     return { ok: false, error: e.message, inUi: 0, outUi: 0 };
+   }
+ }
+@@ -1937,13 +1940,20 @@
+   return sig;
+ }
+ 
++// Item 4a: running realised PnL of the LIVE instance (history rows only;
++// statusFromState reads the paper books, which a live state does not have).
++function liveRealisedUsd(state) { const h = (state && state.history) || []; return h.reduce((s, r) => s + (+(r.pnlUsd != null ? r.pnlUsd : r.netPnlUsd) || 0), 0); }
++function liveRealisedSol(state) { const h = (state && state.history) || []; return h.reduce((s, r) => s + (r.capitalAsset === 'SOL' ? (+(r.pnlCapital != null ? r.pnlCapital : r.netPnlSol) || 0) : 0), 0); }
++function feedHealthStatus() { try { return feedHealth.status(); } catch { return null; } }
++
+ // Telegram notice for a LIVE open / close (the dry run notifies from paperOpen / paperClose; live used to be silent).
+ function liveNotifyOpen(state, p, extra = {}) {
+   try {
+     const pos = state.position || {};
+     telegram.notifyOpen({ name: p.name, pool: p.address, sizeSol: pos.depositSol, quoteSymbol: extra.quoteSymbol || 'SOL', depositQuote: pos.depositSol, usdcIn: pos.usdcIn, gasBufferSol: pos.leftoverSol, leftoverSol: pos.leftoverSol,
+       minBinId: pos.minBinId, maxBinId: pos.maxBinId, entryPrice: pos.entryPrice, ft30m: feeTvl(p, '30m'), tvl: p.tvl, activeBin: pos.entryActiveBin, lastActiveBin: pos.entryActiveBin, shape: pos.shape, openContext: pos.openContext,
+-      paper: false, mintX: pos.mintX, binStep: pos.binStep, nBins: pos.nBins, capitalAsset: pos.capitalAsset, capitalInSol: pos.capitalInSol, openSource: pos.openSource, bins: pos.bins }).catch(() => {});   // card: logo, range, SOL capital
++      paper: false, mintX: pos.mintX, binStep: pos.binStep, nBins: pos.nBins, capitalAsset: pos.capitalAsset, capitalInSol: pos.capitalInSol, openSource: pos.openSource, bins: pos.bins,
++      sigs: extra.sigs, runningRealisedUsd: extra.runningRealisedUsd, runningRealisedSol: extra.runningRealisedSol }).catch(() => {});   // card: logo, range, SOL capital
+   } catch { /* notify must never crash the bot */ }
+ }
+ // Live reposition -> Telegram (Warlock 2.0 card + SOL-first text; failed reopen = alert). The token supply (read-only RPC, cached per mint) turns bins into market cap.
+@@ -1983,10 +1993,10 @@
+     if (!dep || dep.complete || !(dep.depositedLamports > 0) || !Array.isArray(dep.missing) || !dep.missing.length) return;
+     const legs = dep.missing.map(m => `${m.name === 'bidask' ? 'Bid-Ask' : 'Spot'} ${(m.lam / unit).toFixed(quote === 'SOL' ? 4 : 2)} ${quote}${m.partial ? ' (sebagian chunk masuk)' : ''}`).join(', ');
+     const why = (dep.missing[0] && dep.missing[0].error || '').replace(/[1-9A-HJ-NP-Za-km-z]{60,}/g, '<sig>').slice(0, 160);
+-    notifyTg(`⚠️ [LIVE] Open ${p.name}: bentuk posisi TIDAK lengkap. Masuk ${(dep.depositedLamports / unit).toFixed(quote === 'SOL' ? 4 : 2)} ${quote}; gagal: ${legs}. Sisa tetap di wallet sebagai saldo posisi ini (tidak ada top-up otomatis).${why ? '\nAlasan: ' + why : ''}`);
++    notifyTg(`⚠️ Open ${p.name}: bentuk posisi TIDAK lengkap. Masuk ${(dep.depositedLamports / unit).toFixed(quote === 'SOL' ? 4 : 2)} ${quote}; gagal: ${legs}. Sisa tetap di wallet sebagai saldo posisi ini (tidak ada top-up otomatis).${why ? '\nAlasan: ' + why : ''}`);
+   } catch { /* notify is best effort */ }
+ }
+-function notifyTg(text) { try { const r = telegram.send(text); if (r && r.catch) r.catch(() => {}); } catch { /* notify is best effort */ } }
++function notifyTg(text) { try { const r = telegram.send('[LIVE-v2] ' + text); if (r && r.catch) r.catch(() => {}); } catch { /* notify is best effort */ } }   // Item 4a: every raw live send is tagged [LIVE-v2] (all notifyTg call sites are live-only)
+ async function accountExists(pk, tries = 3) {
+   for (let i = 0; i < tries; i++) { try { return !!(await conn.getAccountInfo(pk, 'confirmed')); } catch { await sleep(2500); } }
+   return null;   // unknown: RPC kept failing
+@@ -2107,7 +2117,7 @@
+   if (!(dep.depositedLamports > 0)) { const pos0 = state.position; const gone = await emptyLivePositionCleanup(state, pos0); if (gone || !state.position || !(await repairZeroDeposit(state, state.position))) return { opened: false, skipped: gone ? 'deposit failed: empty position closed' : 'deposit failed: empty position cleanup retried next poll' }; dep.depositedLamports = Math.round(state.position.depositSol * LAMPORTS_PER_SOL); }
+   if (dep.complete) state.position.stage = 'full';
+   saveState(state, path.join(DIR, 'state.json'));
+-  if (!opts.intermediate) liveNotifyOpen(state, p);
++  if (!opts.intermediate) liveNotifyOpen(state, p, { sigs: dep.sigs, runningRealisedSol: liveRealisedSol(state), runningRealisedUsd: liveRealisedUsd(state) });
+   return { opened: true, complete: dep.complete, width: plan.width, wide: plan.wide };
+ }
+ 
+@@ -2144,7 +2154,7 @@
+   if (!(dep.depositedLamports > 0)) { const pos0 = state.position; const gone = await emptyLivePositionCleanup(state, pos0); if (gone || !state.position || !(await repairZeroDeposit(state, state.position))) return { opened: false, skipped: gone ? 'deposit failed: empty position closed' : 'deposit failed: empty position cleanup retried next poll' }; dep.depositedLamports = Math.round(state.position.depositSol * 1e6); }
+   if (dep.complete) state.position.stage = 'full';
+   saveState(state, path.join(DIR, 'state.json'));
+-  if (!opts.intermediate) liveNotifyOpen(state, p, { quoteSymbol: 'USDC' });
++  if (!opts.intermediate) liveNotifyOpen(state, p, { quoteSymbol: 'USDC', sigs: dep.sigs, runningRealisedSol: liveRealisedSol(state), runningRealisedUsd: liveRealisedUsd(state) });
+   return { opened: true, complete: dep.complete, usdcPool: true, width: plan.width, wide: plan.wide };
+ }
+ 
+@@ -2342,11 +2352,12 @@
+   log(`  USDC out ${sb.usdcOut.toFixed(4)} for ${basisUsdc.toFixed(4)} in: ${pnlUsd.toFixed(4)} USDC (${pnlPct.toFixed(3)}%); wallet SOL back to ${after.toFixed(4)} (was ${pos.walletBefore.toFixed(4)} before the position)`);
+   // SL blacklist: record every stop-loss close by token mint, exactly like paperClose (the rule controls skipping at screening/open).
+   if (!opts.intermediate && slBlacklist.isStopLoss(reason)) { try { if (slBlacklist.add(PAPER_DIR, { mint: pos.mintX, symbol: pos.name, pool: pos.pool, reason, closedAt: now(), source: 'auto' })) log('SL blacklist add ' + pos.name + ' ' + pos.mintX); } catch (e) { log('SL blacklist add failed: ' + e.message); } }
++  const closeSigs = Array.isArray(pos.closeSigs) ? pos.closeSigs.filter(Boolean) : [];   // Item 4a: captured BEFORE clearCloseMarks deletes them (they never reached the row or the alert)
+   clearCloseMarks(pos);
+-  const row = { ...pos, closedAt: now(), reason, estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +realized.toFixed(5), usdcIn: basisUsdc, usdcOut: sb.usdcOut, legUsdcIn: pos.usdcIn, legUsdcOut: sb.usdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, pnlCapital: pnlUsd, pnlCapitalPct: pnlPct, solPile: sb.solPile, swapBackComplete: sb.complete, swapBackErrors: sb.errors };
++  const row = { ...pos, closedAt: now(), reason, riskPolicyVersion: 'net-usdc-v2-quote-wait10', quoted: (opts.val && opts.val.quoted != null) ? !!opts.val.quoted : null, valuationBasis: (opts.val && opts.val.quoted === false) ? 'on-chain estimate' : ((opts.val && opts.val.quoted === true) ? 'jupiter quote' : null), estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +realized.toFixed(5), usdcIn: basisUsdc, usdcOut: sb.usdcOut, legUsdcIn: pos.usdcIn, legUsdcOut: sb.usdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, pnlCapital: pnlUsd, pnlCapitalPct: pnlPct, solPile: sb.solPile, swapBackComplete: sb.complete, swapBackErrors: sb.errors, closeSigs, sigs: [...closeSigs, ...(sb.sigs || [])] };
+   row.binShape = liveRowBins(pos); delete row.liveBins;   // closed rows keep the compact snapshot (PnL card bins), not the live chart model
+   if (pendingTokenEstimateUsdc > 0) { row.pendingTokenEstimateUsdc = pendingTokenEstimateUsdc; row.swapBackEstimated = true; const ps = state.pendingSells[state.pendingSells.length - 1]; if (ps && ps.row) ps.row.closedAt = row.closedAt; }
+-  if (!opts.intermediate) { state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json')); }
++  if (!opts.intermediate) { state.history.push(row); row.runningRealisedUsd = liveRealisedUsd(state); row.runningRealisedSol = liveRealisedSol(state); state.position = null; saveState(state, path.join(DIR, 'state.json')); }
+   liveNotifyClose(row, reason, opts);
+   log(`  closed${opts.intermediate ? ' (reposition leg)' : ''}. wallet ${after.toFixed(4)} SOL, USDC ${afterUsdc.toFixed(2)}${pendingTokenEstimateUsdc > 0 ? `; unsold token booked at ~${pendingTokenEstimateUsdc.toFixed(2)} USDC until sold` : ''}`);
+   return { usdcOut: sb.usdcOut, row };
+@@ -2388,11 +2399,12 @@
+   const legUsdcOut = solOut * px, basisUsdc = pos.initialUsdcIn || pos.usdcIn, pnlUsd = legUsdcOut - pos.usdcIn + (pos.realizedPnlCarryUsd || 0);
+   log(`  SOL out ${solOut.toFixed(6)} for ${capIn.toFixed(6)} in: ${pnlCapital.toFixed(6)} SOL (${pnlPct.toFixed(3)}%) = ${pnlUsd.toFixed(2)} USD at SOL $${px.toFixed(2)}; wallet SOL ${(sb.solAfter || 0).toFixed(4)}`);
+   if (!opts.intermediate && slBlacklist.isStopLoss(reason)) { try { if (slBlacklist.add(PAPER_DIR, { mint: pos.mintX, symbol: pos.name, pool: pos.pool, reason, closedAt: now(), source: 'auto' })) log('SL blacklist add ' + pos.name + ' ' + pos.mintX); } catch (e) { log('SL blacklist add failed: ' + e.message); } }
++  const closeSigs = Array.isArray(pos.closeSigs) ? pos.closeSigs.filter(Boolean) : [];   // Item 4a: captured BEFORE clearCloseMarks deletes them
+   clearCloseMarks(pos);
+-  const row = { ...pos, closedAt: now(), reason, estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +(solOut - capIn).toFixed(5), capitalAsset: 'SOL', solOut, solUsd: px, usdcIn: basisUsdc, usdcOut: basisUsdc + pnlUsd, legUsdcIn: pos.usdcIn, legUsdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, netPnlSol: pnlCapital, pnlCapital, pnlCapitalPct: pnlPct, solPile: solOut, swapBackComplete: sb.complete, swapBackErrors: sb.errors };
++  const row = { ...pos, closedAt: now(), reason, riskPolicyVersion: 'net-usdc-v2-quote-wait10', quoted: (opts.val && opts.val.quoted != null) ? !!opts.val.quoted : null, valuationBasis: (opts.val && opts.val.quoted === false) ? 'on-chain estimate' : ((opts.val && opts.val.quoted === true) ? 'jupiter quote' : null), estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +(solOut - capIn).toFixed(5), capitalAsset: 'SOL', solOut, solUsd: px, usdcIn: basisUsdc, usdcOut: basisUsdc + pnlUsd, legUsdcIn: pos.usdcIn, legUsdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, netPnlSol: pnlCapital, pnlCapital, pnlCapitalPct: pnlPct, solPile: solOut, swapBackComplete: sb.complete, swapBackErrors: sb.errors, closeSigs, sigs: [...closeSigs, ...(sb.sigs || [])] };
+   row.binShape = liveRowBins(pos); delete row.liveBins;   // closed rows keep the compact snapshot (PnL card bins), not the live chart model
+   if (pendingTokenEstimateSol > 0) { row.pendingTokenEstimateSol = pendingTokenEstimateSol; row.swapBackEstimated = true; const ps = state.pendingSells[state.pendingSells.length - 1]; if (ps && ps.row) ps.row.closedAt = row.closedAt; }
+-  if (!opts.intermediate) { state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json')); }
++  if (!opts.intermediate) { state.history.push(row); row.runningRealisedUsd = liveRealisedUsd(state); row.runningRealisedSol = liveRealisedSol(state); state.position = null; saveState(state, path.join(DIR, 'state.json')); }
+   liveNotifyClose(row, reason, opts);
+   log(`  closed${opts.intermediate ? ' (reposition leg)' : ''}. wallet ${(sb.solAfter || 0).toFixed(4)} SOL${pendingTokenEstimateSol > 0 ? `; unsold token booked at ~${pendingTokenEstimateSol.toFixed(5)} SOL until sold` : ''}`);
+   return { usdcOut: legUsdcOut, solOut, row };
+@@ -2436,6 +2448,7 @@
+       stopHow: 'touch /workspace/lp-bot/paper/STOP  (do not remove /workspace/lp-bot/STOP)',
+     } : (root.paperRun || null),
+     lastScan: CFG.PAPER ? undefined : (state.lastScan || root.lastScan),
++    ...(CFG.PAPER ? {} : { feedHealth: feedHealthStatus() }),
+     closedTrades: root.closedTrades || [],
+     totalRealizedSol: root.totalRealizedSol,
+     ...extra,
+@@ -2588,12 +2601,14 @@
+       pollId = state.livePollSequence = (state.livePollSequence || 0) + 1;
+       const r = await liveExit.decideLiveExit({ pos: state.position, v, pxUsd: await solUsd(), quote: jupiterQuote, txFee: CFG.TX_FEE_SOL, CFG, pollId });
+       live.pnlUsdcPct = +r.val.pnlPct.toFixed(2); live.pnlUsd = +r.val.pnlUsd.toFixed(2); live.quoted = !!r.val.quoted;
++      try { if (r.val && r.val.quoted === false) feedHealth.recordQuoteWait(state.position.quoteUnavailablePolls || 0); } catch { /* feed-health reporting must never break the cycle */ }
+       exitReason = r.reason; decisionVal = r.val; state.position.lastLive = { pnlPct: live.pnlUsdcPct };
+       // An emergency stop is final (it closes the position at the market), so it must survive a second independent reading a few seconds later: a lagging RPC, a half-landed deposit or a half-withdrawn position all look like a sudden -50% for one poll.
+       if (exitReason === 'emergency_stop') {
+         log(`  emergency_stop signalled at ${live.pnlUsdcPct}%: re-reading the position before closing`);
+         await sleep(4000);
+         try { const v2 = await liveValuation(state.position), r2 = await liveExit.decideLiveExit({ pos: state.position, v: v2, pxUsd: await solUsd(), quote: jupiterQuote, txFee: CFG.TX_FEE_SOL, CFG, pollId });   // SAME pollId: the confirm read never advances the policy counters a second time (live-pnl-fix)
++        try { if (r2.val && r2.val.quoted === false) feedHealth.recordQuoteWait(state.position.quoteUnavailablePolls || 0); } catch { /* feed-health reporting must never break the cycle */ }
+           if (r2.reason !== 'emergency_stop') { log(`  second reading ${(r2.val.pnlPct).toFixed(2)}%: no emergency, position kept`); exitReason = r2.reason === 'oor_right_reposition' ? null : r2.reason; decisionVal = r2.val; }
+           else log(`  second reading ${(r2.val.pnlPct).toFixed(2)}%: emergency confirmed`);
+         } catch (e) { log('  second reading failed, position kept: ' + e.message); exitReason = null; } }
+@@ -2635,6 +2650,7 @@
+             pos0.shape = pol.RESHAPE_SHAPE === 'SPOT' ? 'reshape-spot' : 'M-double-bidask';
+             saveState(state, path.join(DIR, 'state.json'));
+             log(`  RESHAPE #${pos0.reshapes} ${pos0.name}: right=${ev.range.rightMin}..${ev.range.rightMax} token re-add X=${ev.amountX} compounded=${(ev.compounded || 0).toFixed(6)} ${ev.errors.length ? 'ERRORS: ' + ev.errors.join(' | ') : ''}`);
++            if (CFG.NOTIFY_RESHAPE === true) { try { telegram.notifyReshape({ name: pos0.name, pool: pos0.pool, mintX: pos0.mintX, reshapes: pos0.reshapes, activeBin: v.activeBinId, rightMin: ev.range && ev.range.rightMin, rightMax: ev.range && ev.range.rightMax, amountX: ev.amountX, feeXAdded: ev.feeXAdded, feeYAdded: ev.compounded, quoteSymbol: pos0.quoteSymbol || 'SOL', errors: ev.errors, sigs: ev.sigs, paper: false }).catch(() => {}); } catch { /* notify must never break the cycle */ } }   // Item 4a: gated on NOTIFY_RESHAPE (default false — operator t238u: reshape alerts are too noisy; flip the flag to re-enable)
+             // like the dry run: re-value after the reshape and decide again with the same policy
+             const v2 = await liveValuation(pos0), pollId2 = state.livePollSequence = (state.livePollSequence || 0) + 1;
+             if (ev.errors && ev.errors.length) { log('  reshape had errors: no exit decision this poll (tokens may be outside the position)'); } else {
+@@ -2646,7 +2662,7 @@
+       } catch (e) { log('reshape error (position held, retry next poll): ' + e.message); }
+     }
+   }
+-  if (exitReason) await liveClose(state, exitReason);
++  if (exitReason) await liveClose(state, exitReason, { val: decisionVal });   // Item 4a: the close row records whether the exit was valued on a live quote or an on-chain estimate
+   else saveState(state, path.join(DIR, 'state.json'));   // persist peak / TP-emergency / SL+ state exactly like the dry run
+   return live;
+ }
+@@ -2808,6 +2824,11 @@
+   if (testActive) log(`tes live terawasi aktif: maks ${testActive.maxPositions} posisi, maks ${testActive.maxPositionSol} SOL/posisi, sisa ${Math.round(testActive.msLeft / 60000)} menit`);
+   const stop = fs.existsSync(path.join(DIR, 'STOP')) || testOver;
+   const noNew = fs.existsSync(path.join(DIR, 'NO_NEW'));
++  if (stop && !state.killSwitchNotified) { state.killSwitchNotified = true; try { telegram.notifyKillSwitch({ kind: 'STOP', openCount: state.positions.length, positions: state.positions.map(p => p.name) }).catch(() => {}); } catch { /* notify must never break the cycle */ } }
++  if (!stop) state.killSwitchNotified = false;
++  if (noNew && !state.noNewNotified) { state.noNewNotified = true; try { telegram.notifyKillSwitch({ kind: 'NO_NEW', openCount: state.positions.length, positions: state.positions.map(p => p.name) }).catch(() => {}); } catch { /* notify must never break the cycle */ } }
++  if (!noNew) state.noNewNotified = false;
++  try { await solUsd(); } catch { /* feed-health only: one price read per live cycle, so the stale counter advances even when flat */ }
+   state.positions = livePositions.dedupeList(livePositions.list(state)); state.position = null; state.__active = null;
+   const lives = [];
+   for (const pos of [...state.positions]) {
+@@ -2815,6 +2836,7 @@
+     catch (e) { log(`position cycle error ${pos.name} (held, retry next poll): ${e.message}`); }
+   }
+   saveState(state, path.join(DIR, 'state.json'));
++  { const fh = feedHealth.status(); if (fh.stalePollsConsecutive >= 3 && !state.feedDegradedNotified) { state.feedDegradedNotified = true; try { telegram.notifyFeedDegraded(fh).catch(() => {}); } catch { /* notify must never break the cycle */ } } if (fh.stalePollsConsecutive === 0) state.feedDegradedNotified = false; }   // Item 4a: feed-DEGRADED alert only — the no-open rule + NO_NEW write are Item 1
+   if (state.positions.length) await writeLiveStatusPointer(state, { live: lives[0], lives });
+   if (stop) { if (state.positions.length) return false; log('STOP file present, no position -> exiting'); await writeLiveStatusPointer(state); return true; }   // exit only when flat
+   if (noNew) {
+@@ -2981,20 +3003,26 @@
+   } catch (e) {
+     log('fatal: ' + e.message);
+     const mark = path.join(DIR, 'state-unreadable.notified');
+-    try { if (!fs.existsSync(mark) || Date.now() - fs.statSync(mark).mtimeMs > 3600_000) { fs.writeFileSync(mark, now()); telegram.send('🛑 Live bot NOT started: state.json is unreadable and no valid backup exists. Positions may be open on chain; fix the state file by hand.'); await sleep(5000); } } catch { /* ignore */ }
++    try { if (!fs.existsSync(mark) || Date.now() - fs.statSync(mark).mtimeMs > 3600_000) { fs.writeFileSync(mark, now()); telegram.send('[LIVE-v2] 🛑 Live bot NOT started: state.json is unreadable and no valid backup exists. Positions may be open on chain; fix the state file by hand.'); await sleep(5000); } } catch { /* ignore */ }
+     await sleep(60_000);   // pm2 restarts us: keep the loop slow
+     process.exit(1);
+   }
++  try { telegram.installProcessHandlers(); } catch { /* ignore */ }   // Item 4a: crash alerts for the live instance (paper branch already installs them)
++  try {
++    const nr = await telegram.notifyStartup(telegram.statusFromLiveState(state, { wallet: REAL_WALLET, stopPresent: fs.existsSync(path.join(DIR, 'STOP')), maxPositions: CFG.MAX_POSITIONS, feedHealth: feedHealth.status() }));
++    log(nr && nr.ok ? 'telegram startup notify delivered' : `telegram startup notify not sent${nr && nr.skipped ? ' (' + nr.skipped + ')' : (nr && nr.error ? ' (' + nr.error + ')' : '')}`);
++  } catch (e) { log('telegram startup notify failed (bot continues)'); }
+   while (true) {
+     let exit = false;
+     try { exit = await liveCycle(state); }
+-    catch (e) { log('cycle error: ' + (e.stack || e.message).split('\n').slice(0, 3).join(' / ')); }
++    catch (e) { log('cycle error: ' + (e.stack || e.message).split('\n').slice(0, 3).join(' / ')); try { telegram.notifyError(e, 'cycle error').catch(() => {}); } catch { /* ignore */ } }
+     if (exit || CFG.ONCE) break;
+     // Same cadence as the dry run: with an open position the TP / SL / emergency / reshape checks run every ~10 s; flat = scan every POLL_SEC (5 min).
+     let openNow = 0; try { openNow = livePositions.list(state).length; } catch { /* ignore */ }
+     const waitSteps = openNow > 0 ? 2 : CFG.POLL_SEC / 5;
+     for (let i = 0; i < waitSteps; i++) {
+       await sleep(5000);
++      try { telegram.maybeDailySummary(telegram.statusFromLiveState(state, { wallet: REAL_WALLET, stopPresent: fs.existsSync(path.join(DIR, 'STOP')), maxPositions: CFG.MAX_POSITIONS, feedHealth: feedHealth.status() })).catch(() => {}); } catch { /* ignore */ }   // Item 4a: daily heartbeat (21:00 WIB) — a missing day is itself visible
+       if (fs.existsSync(path.join(DIR, 'STOP'))) break;
+       if (scanRequested()) break;   // the Mini App "Scan ulang sekarang" button
+     }

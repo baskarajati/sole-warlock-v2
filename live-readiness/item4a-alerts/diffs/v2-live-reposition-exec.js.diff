@@ -1,0 +1,28 @@
+--- pristine-v2/live-reposition-exec.js	2026-11-22 16:54:31.000000000 +0000
++++ patched-v2/live-reposition-exec.js	2026-11-24 17:49:22.986379278 +0000
+@@ -37,7 +37,7 @@
+   const solCap = old.capitalAsset === 'SOL', proceeds = Math.max(0, leg.usdcOut);
+   state.position = null;
+   let opened = null;
+-  const openArgs = { source: 'reposition', strategySettings: old.strategySettings, positionBudgetUsdc: proceeds, capitalAsset: solCap ? 'SOL' : 'USDC', ...(solCap ? { positionBudgetSol: Math.max(0, leg.solOut) } : {}) };
++  const openArgs = { source: 'reposition', intermediate: true, strategySettings: old.strategySettings, positionBudgetUsdc: proceeds, capitalAsset: solCap ? 'SOL' : 'USDC', ...(solCap ? { positionBudgetSol: Math.max(0, leg.solOut) } : {}) };   // Item 4a: intermediate — the reopen must not fire a second standalone open alert; notifyReposition covers the combined event
+   const tries = [];
+   try { opened = await deps.openNew(pool, openArgs); }
+   catch (e) { log('reposition reopen error: ' + e.message); opened = { error: e.message }; }
+@@ -54,7 +54,7 @@
+   // Telegram (Warlock 2.0 reposition card / reopen-failed alert): display only, never blocks or changes the reposition
+   const event = { number, name: old.name, pool: old.pool, mintX: old.mintX, binStep: old.binStep, capitalAsset: solCap ? 'SOL' : 'USDC', solUsd: pxUsd, paper: false,
+     pnlCapital: solCap ? leg.solOut - old.capitalInSol : null, pnlPct: solCap ? (old.capitalInSol ? 100 * (leg.solOut - old.capitalInSol) / old.capitalInSol : null) : (old.usdcIn ? 100 * (leg.usdcOut - old.usdcIn) / old.usdcIn : null),
+-    pnlUsd: leg.usdcOut - old.usdcIn, proceedsSol: solCap ? leg.solOut : null, proceedsUsdc: leg.usdcOut, reason: deps.reasonText || null, oldMinBinId: old.minBinId, oldMaxBinId: old.maxBinId,
++    pnlUsd: leg.usdcOut - old.usdcIn, proceedsSol: solCap ? leg.solOut : null, proceedsUsdc: leg.usdcOut, sigs: (leg.row && Array.isArray(leg.row.sigs)) ? leg.row.sigs.filter(Boolean) : [], reason: deps.reasonText || null, oldMinBinId: old.minBinId, oldMaxBinId: old.maxBinId,   // Item 4a fix N2: leg close sigs (remove/claim + swap-back) ride the event to the reposition card
+     refPrice: old.entryPrice, refBin: old.entryActiveBin, openContext: old.openContext, openSource: old.openSource, strategySettings: old.strategySettings, tries, at: now() };
+   const notify = (kind, extra) => { try { if (deps.notify) Promise.resolve(deps.notify(kind, { ...event, ...extra })).catch(() => {}); } catch { /* display only */ } };
+   if (!state.position) {                                         // the leg is already closed on chain: it becomes an ordinary close, never a lost trade
+@@ -67,6 +67,6 @@
+   log(`REPOSITION KANAN #${number} ${old.name}: range ${state.position.minBinId}..${state.position.maxBinId}; carryPnL=${set.realizedPnlCarryUsd.toFixed(4)} USDC`);
+   const np = state.position;
+   notify('reposition', { minBinId: np.minBinId, maxBinId: np.maxBinId, activeBin: np.entryActiveBin, refPrice: np.entryPrice || event.refPrice, refBin: np.entryActiveBin ?? event.refBin, nBins: np.nBins, shape: np.shape, bins: np.bins, binShape: np.binShape, depositSol: np.depositSol });
+-  return { done: true, reopened: true, number, set };
++  return { done: true, reopened: true, number, set, leg };   // Item 4a: the closed leg, for the reposition alert
+ }
+ module.exports = { reposition, carryFields };

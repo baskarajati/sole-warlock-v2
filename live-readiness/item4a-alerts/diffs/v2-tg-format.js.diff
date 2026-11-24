@@ -1,0 +1,70 @@
+--- pristine-v2/tg-format.js	2026-11-22 16:54:31.000000000 +0000
++++ patched-v2/tg-format.js	2026-11-24 17:48:50.876379526 +0000
+@@ -7,7 +7,7 @@
+ // quote-denominated LP PnL (paper-quote-pnl): only when it has a value, folded with the details
+ function quoteLines(x) { try { const q = require('./paper-quote-pnl'), t = q.format(x), c = q.solChange(x); return [t && !/belum tersedia|not available/i.test(t) ? `📊 PnL LP (quote) ${esc(t)}` : null, c ? `📉 ${esc(c)}` : null]; } catch { return []; } }
+ const L = (lang, id, en) => (lang === 'en' ? en : id);
+-const mode = (paper) => (paper ? '🧪 DRY RUN' : '🔴 LIVE');
++const mode = (paper) => (paper ? '🧪 DRY RUN' : '🔴 [LIVE-v2]');   // Item 4a fix N1: the literal [LIVE-v2] marker must appear in every card render, so a v2 card is distinguishable from a v1 🔴 LIVE card
+ const short = (a) => { a = String(a || ''); return a.length > 12 ? `${a.slice(0, 4)}…${a.slice(-4)}` : a; };
+ const pairOf = (name) => { const p = f.pair(name); return `${esc(p.base)}/${esc(p.quote)}`; };
+ const ICON = { win: '✅', loss: '🔻', be: '⚪', open: '🟣' };
+@@ -43,6 +43,10 @@
+       num(rec.swapCostUsd) != null ? `💸 Swap ${f.usd(rec.swapCostUsd, { signed: false })}` : null,
+       ...quoteLines(rec),
+       sol && px ? `💱 SOL @ $${px.toFixed(2)}${num(rec.pnlUsd) != null ? ` · ${L(lang, 'nilai USD vs entry', 'USD value vs entry')} ${f.usd(rec.pnlUsd)}` : ''}` : null,
++      rec.quoted === false ? `⚠️ ${esc(L(lang, 'Valuasi: estimasi on-chain (quote Jupiter tidak tersedia saat exit diputuskan)', 'Valuation: on-chain estimate (no Jupiter quote when the exit was decided)'))}` : null,
++      rec.swapBackComplete === false ? `⚠️ ${esc(L(lang, 'Swap-back TIDAK lengkap', 'Swap-back incomplete'))}: ${esc((rec.swapBackErrors || []).join(' | '))}` : null,
++      Array.isArray(rec.sigs) && rec.sigs.length ? `🔗 Tx ${rec.sigs.filter(Boolean).map((s) => `<code>${esc(short(s))}</code>`).join(' ')}` : null,
++      num(rec.runningRealisedUsd) != null ? `📈 ${esc(L(lang, 'Realisasi kumulatif', 'Running realised'))} ${f.usd(rec.runningRealisedUsd)}` : null,
+       ...extra.map(esc),
+     ]),
+   ]);
+@@ -69,6 +73,8 @@
+       `💸 Non-refundable entry ${s.entryCostEstimate && s.entryCostEstimate.known ? `${f.sol(s.entryCostEstimate.nonrefTotalSol, { signed: false })} SOL` : '—'}`,
+       ...quoteLines(e),
+       `🛡 Filter ${s.passedAllFilters === true ? L(lang, 'lolos semua', 'all passed') : s.passedAllFilters === false ? '⚠ ' + esc((s.failedFilters || []).join('; ')) : '—'}`,
++      Array.isArray(e.sigs) && e.sigs.length ? `🔗 Tx ${e.sigs.filter(Boolean).map((s) => `<code>${esc(short(s))}</code>`).join(' ')}` : null,
++      num(e.runningRealisedUsd) != null ? `📈 ${esc(L(lang, 'Realisasi kumulatif', 'Running realised'))} ${f.usd(e.runningRealisedUsd)}` : null,
+     ]),
+   ]);
+ }
+@@ -97,7 +103,7 @@
+     `🎯 Active bin ${e.activeBin ?? '?'}`,
+     triesLine(e.tries, lang),
+     `🧮 <i>${L(lang, 'Swap, gas, rent dihitung · PnL lama diteruskan · batas hold tidak direset', 'Swap, gas, rent booked · old PnL carried over · hold limit not reset')}</i>`,
+-    fold([e.pool ? `📍 Pool <code>${esc(e.pool)}</code>` : null, e.openContext && e.openContext.source ? `🧭 ${esc(e.openContext.source)} · ${esc(e.openContext.reason || '')}` : null, num(e.supply) ? `🪙 Supply ${(+e.supply).toLocaleString('en-US', { maximumFractionDigits: 0 })} · SOL @ $${num(e.solUsd) ? (+e.solUsd).toFixed(2) : '?'}` : null]),
++    fold([e.pool ? `📍 Pool <code>${esc(e.pool)}</code>` : null, e.openContext && e.openContext.source ? `🧭 ${esc(e.openContext.source)} · ${esc(e.openContext.reason || '')}` : null, num(e.supply) ? `🪙 Supply ${(+e.supply).toLocaleString('en-US', { maximumFractionDigits: 0 })} · SOL @ $${num(e.solUsd) ? (+e.solUsd).toFixed(2) : '?'}` : null, Array.isArray(e.sigs) && e.sigs.length ? `🔗 Tx ${e.sigs.filter(Boolean).map((s) => `<code>${esc(short(s))}</code>`).join(' ')}` : null]),   // Item 4a fix N2: leg close sigs, shortened like the close card
+   ]);
+ }
+ // the leg closed but no new position could be opened: the SOL (or USDC) is back in the wallet, booked as a normal close
+@@ -113,7 +119,7 @@
+     num(e.oldMinBinId) != null ? `📐 ${L(lang, 'Range lama', 'Old range')} ${rangeLine(e.oldMinBinId, e.oldMaxBinId, e)}` : null,
+     triesLine(e.tries, lang),
+     `📒 <i>${L(lang, 'Dicatat sebagai close biasa (history). Tidak ada posisi terbuka di pool ini; bot lanjut scan (cooldown pool 30 menit).', 'Booked as a normal close. No position open on this pool; the bot keeps scanning (30 min pool cooldown).')}</i>`,
+-    fold([e.pool ? `📍 Pool <code>${esc(e.pool)}</code>` : null]),
++    fold([e.pool ? `📍 Pool <code>${esc(e.pool)}</code>` : null, Array.isArray(e.sigs) && e.sigs.length ? `🔗 Tx ${e.sigs.filter(Boolean).map((s) => `<code>${esc(short(s))}</code>`).join(' ')}` : null]),   // Item 4a fix N2: same leg sigs as the success card — the failed-reopen alert is the only alert for that close
+   ]);
+ }
+ 
+@@ -126,7 +132,10 @@
+     `🎯 Active bin ${e.activeBin ?? '?'}  ·  📐 ${L(lang, 'kanan', 'right')} ${e.rightMin ?? '?'} → ${e.rightMax ?? '?'}`,
+     `🧩 Token di-add ${num(e.amountX) != null ? (+e.amountX).toLocaleString('en-US', { maximumFractionDigits: 2 }) : '—'}  <i>(withdrawn ${num(e.tokenX) != null ? (+e.tokenX).toLocaleString('en-US', { maximumFractionDigits: 2 }) : '—'} + fee ${num(e.feeXAdded) != null ? (+e.feeXAdded).toLocaleString('en-US', { maximumFractionDigits: 2 }) : '—'})</i>`,
+     `🌾 Fee ${q} di-compound ${f.sol(e.feeYAdded, { signed: false })} ${q}`,
+-    fold([e.pool ? `📍 Pool <code>${esc(e.pool)}</code>` : null]),
++    fold([e.pool ? `📍 Pool <code>${esc(e.pool)}</code>` : null,
++      Array.isArray(e.errors) && e.errors.length ? `⚠️ ${esc(e.errors.join(' | '))}` : null,
++      Array.isArray(e.sigs) && e.sigs.length ? `🔗 Tx ${e.sigs.filter(Boolean).map((s) => `<code>${esc(short(s))}</code>`).join(' ')}` : null,
++    ]),
+   ]);
+ }
+ 
+@@ -180,6 +189,8 @@
+     solCap ? `💼 ${L(lang, 'Modal bebas', 'Free capital')} ${f.sol(st.freeCapitalSol, { signed: false })} SOL${num(st.pnlTotalSol) != null ? `  ·  ${L(lang, 'total', 'total')} ${f.sol(st.pnlTotalSol)} SOL` : ''}` : `💼 ${L(lang, 'Modal', 'Capital')} ${f.usd(st.virtualUsdc, { signed: false })}  ·  PnL ${f.usd(st.pnlTotalUsd)}`,
+     `📌 ${L(lang, 'Posisi', 'Positions')} ${st.openCount || 0}/${st.maxPositions || 5}${pos.length ? '' : ` · ${L(lang, 'tidak ada', 'none')}`}`,
+     ...pos,
++    st.live && st.feedHealth ? `📡 Feed/jam: CoinGecko 429 ${st.feedHealth.coingecko429} · Jupiter 429 ${st.feedHealth.jupiter429} · stale poll ${st.feedHealth.stalePolls} · quote-wait ${st.feedHealth.quoteWaits} (maks ${st.feedHealth.quoteWaitMaxPolls} poll)` : null,
++    st.live ? (st.feesPaidUsd != null ? `💸 Fee dibayar: ${f.usd(st.feesPaidUsd, { signed: false })}` : `💸 Fee dibayar: ${esc(L(lang, 'tidak dicatat per leg (live rows tidak menyimpan biaya swap/gas)', 'not recorded per leg (live rows do not store swap/gas costs)'))}`) : null,
+     st.endsWib ? `🗓 Window ${L(lang, 'sampai', 'until')} ${esc(st.endsWib)}` : null,
+     a && a.be ? `<i>BE = |PnL| &lt; ${O.BE_PCT}%, ${L(lang, 'tidak dihitung win rate', 'excluded from win rate')}</i>` : null,
+   ]);

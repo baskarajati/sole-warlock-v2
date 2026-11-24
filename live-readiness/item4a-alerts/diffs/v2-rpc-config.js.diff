@@ -1,0 +1,18 @@
+--- pristine-v2/rpc-config.js	2026-11-22 16:54:31.000000000 +0000
++++ patched-v2/rpc-config.js	2026-11-24 16:55:26.718858814 +0000
+@@ -85,6 +85,7 @@
+         const res = await fetchImpl(s.url, { ...rest, signal: ac.signal });
+         if (res.status === 429 || res.status >= 500) {
+           markBad(s.slot, res.status === 429 ? 'rate-limit 429' : 'http ' + res.status, res.status === 429 ? COOLDOWN.rate : COOLDOWN.error, now());
++          try { require('./feed-health').recordRpcError(); } catch { /* reporting only: never break the RPC path */ }   // Item 4a: RPC errors/hour (rolling)
+           if (log) log(`rpc slot ${s.slot} (${hostOf(s.url)}) ${res.status === 429 ? 'rate limited' : 'error ' + res.status}${last ? '' : ', switching to slot ' + tries[i + 1].slot}`);
+           lastRes = res; if (!last) { try { if (res.body && res.body.cancel) res.body.cancel().catch(() => {}); } catch { /* ignore */ } continue; } return res;
+         }
+@@ -93,6 +94,7 @@
+       } catch (e) {
+         const why = /timeout|abort/i.test(String(e && (e.message || e.name))) || ac.signal.aborted ? 'timeout' : 'network';
+         markBad(s.slot, why, COOLDOWN.error, now());
++        try { require('./feed-health').recordRpcError(); } catch { /* reporting only: never break the RPC path */ }   // Item 4a: RPC errors/hour (rolling)
+         if (log) log(`rpc slot ${s.slot} (${hostOf(s.url)}) ${why}${last ? '' : ', switching to slot ' + tries[i + 1].slot}`);
+         lastErr = new Error('rpc ' + why + ' on slot ' + s.slot);   // never the URL (it carries the key)
+         if (last) { if (lastRes) return lastRes; throw lastErr; }

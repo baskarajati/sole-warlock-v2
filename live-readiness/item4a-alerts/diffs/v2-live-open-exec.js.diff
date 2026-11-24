@@ -1,0 +1,61 @@
+--- pristine-v2/live-open-exec.js	2026-11-22 16:54:31.000000000 +0000
++++ patched-v2/live-open-exec.js	2026-11-24 16:55:26.710267438 +0000
+@@ -11,7 +11,7 @@
+   if (spotLam > 0) parts.push({ type: StrategyType.Spot, name: 'spot', lam: spotLam });
+   if (bidLam > 0) parts.push({ type: StrategyType.BidAsk, name: 'bidask', lam: bidLam });
+   if (!parts.length) throw new Error('nothing to deposit');
+-  let deposited = 0, complete = true, created = false;   // created = the position exists on chain
++  let deposited = 0, complete = true, created = false; const sigs = [];   // Item 4a: sigs of the deposit txs, for the open alert
+   // live-open-fix (20 Nov 2026, DCTY 14:09 WIB: the BidAsk leg failed with Custom 6004 ExceededBinSlippageTolerance and the position stayed Spot-only):
+   //  - every leg is built on a FRESH active bin (refetchStates right before the build; the SDK reads lbPair.activeId from its cached state),
+   //  - deposits use max(SLIPPAGE_PCT, 5)% bin slippage (SOL-only adds below the price: this only loosens the shape tolerance, like the reshape token add),
+@@ -23,13 +23,14 @@
+   const retryable = e => !e.unknownStatus && (/Blockhash not found|Simulation failed/i.test(String(e.message)) || isBinSlippage(e));
+   const sendLeg = async (label, build, signers) => {
+     let last;
++    const legSigs = [];
+     for (let k = 1; k <= LEG_TRIES; k++) {
+       let sentChunks = 0;
+       try {
+         await refresh();
+         const built = await build(); const txs = Array.isArray(built) ? built : [built];
+-        for (const [j, t] of txs.entries()) { await send(t, signers, txs.length > 1 ? `${label} ${j + 1}/${txs.length}` : label); sentChunks++; }
+-        return;
++        for (const [j, t] of txs.entries()) { legSigs.push(await send(t, signers, txs.length > 1 ? `${label} ${j + 1}/${txs.length}` : label)); sentChunks++; }
++        return legSigs;
+       } catch (e) {
+         last = e;
+         if (sentChunks > 0 || !retryable(e) || k === LEG_TRIES) { if (sentChunks > 0) e.partialLeg = true; throw e; }
+@@ -60,19 +61,19 @@
+       await noteActiveMoved(i === 0 ? 'open' : 'add-' + part.name);
+       if (i === 0) {
+         if (!plan.wide) {
+-          await sendLeg('open-' + part.name, () => dlmm.initializePositionAndAddLiquidityByStrategy(params), [wallet, posKp]); created = true;
++          sigs.push(...(await sendLeg('open-' + part.name, () => dlmm.initializePositionAndAddLiquidityByStrategy(params), [wallet, posKp]))); created = true;
+         } else {
+           const tx0 = await dlmm.createExtendedEmptyPosition(plan.minBinId, plan.maxBinId, posKp.publicKey, wallet.publicKey);
+-          await send(tx0, [wallet, posKp], 'open-extended-empty'); created = true;
++          sigs.push(await send(tx0, [wallet, posKp], 'open-extended-empty')); created = true;
+           await onCreated({ depositedLamports: 0 });                       // the position exists on chain: record it before depositing
+           await noteActiveMoved('add-' + part.name);
+-          await sendLeg('add-' + part.name, () => dlmm.addLiquidityByStrategyChunkable(params), [wallet]);
++          sigs.push(...(await sendLeg('add-' + part.name, () => dlmm.addLiquidityByStrategyChunkable(params), [wallet])));
+         }
+         deposited += part.lam;
+         if (!plan.wide) await onCreated({ depositedLamports: deposited }); // narrow: created together with the first deposit
+         else await onCreated({ depositedLamports: deposited, update: true });
+       } else {
+-        await sendLeg('add-' + part.name, () => (plan.wide ? dlmm.addLiquidityByStrategyChunkable(params) : dlmm.addLiquidityByStrategy(params)), [wallet]);
++        sigs.push(...(await sendLeg('add-' + part.name, () => (plan.wide ? dlmm.addLiquidityByStrategyChunkable(params) : dlmm.addLiquidityByStrategy(params)), [wallet])));
+         deposited += part.lam;
+       }
+     } catch (e) {
+@@ -83,7 +84,7 @@
+       break;
+     }
+   }
+-  return { complete, depositedLamports: deposited, totalLamports: total, parts: parts.map(p => ({ name: p.name, lam: p.lam })), missing };
++  return { complete, depositedLamports: deposited, totalLamports: total, parts: parts.map(p => ({ name: p.name, lam: p.lam })), missing, sigs };
+ }
+ // live-pnl-fix (20 Nov 2026): one place that books the deposit (liveOpen + liveOpenUsdcPool). Pure: no IO, log injected.
+ //  real = quote amount read on chain (null = RPC read failed -> fall back to the bot's own count of landed txs).

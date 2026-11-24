@@ -1,0 +1,59 @@
+--- pristine-v2/live-close-exec.js	2026-11-22 16:54:31.000000000 +0000
++++ patched-v2/live-close-exec.js	2026-11-24 16:55:26.712664962 +0000
+@@ -9,12 +9,12 @@
+ const SWAP_FEE_KEEP = 0.003;   // SOL that must stay to pay the pile swap itself
+ const SOL_DUST = 0.0005;   // below this a swap costs more than it returns (a swap of the pile is skipped only under this)
+ async function swapBack({ pos, pileSol, getToken, swapTokenToUsdc, closeTokenAccounts, getSolBalance, swapSolToUsdc, getUsdcBalance, sleep = async () => {}, log = () => {}, retries = 3, canSweepStray = null }) {
+-  const out = { usdcBefore: await getUsdcBalance(), tokenSwapped: 0, straySwapped: 0, solSwapped: 0, errors: [] };
++  const out = { usdcBefore: await getUsdcBalance(), tokenSwapped: 0, straySwapped: 0, solSwapped: 0, errors: [], sigs: [] };   // Item 4a: swap sigs, for the close alert
+   const attempt = async (name, fn) => { for (let i = 1; i <= retries; i++) { try { return await fn(); } catch (e) { out.errors.push(`${name} #${i}: ${e.message}`); log(`  ${name} failed (${i}/${retries}): ${e.message}`); await sleep(2000); } } return null; };
+   const tok = await getToken();
+   if (tok && tok.raw > 0n) {
+     const r = await attempt('token->USDC', async () => { const x = await swapTokenToUsdc(tok.raw, tok.decimals); if (!x || x.ok === false) throw new Error((x && x.error) || 'swap failed'); return x; });
+-    if (r) { out.tokenSwapped = Number(tok.raw); await attempt('close token account', () => closeTokenAccounts(tok)); }
++    if (r) { out.tokenSwapped = Number(tok.raw); if (r.sig) out.sigs.push(r.sig); await attempt('close token account', () => closeTokenAccounts(tok)); }
+     await sleep(3000);
+   }
+   // SWEEP stray dust of this mint (see header): only when the position's own tokens are gone and no other open position shares the mint.
+@@ -26,7 +26,7 @@
+         const stray = tok2 ? (tok2.total != null ? tok2.total : tok2.raw) : 0n;
+         if (stray > 0n) {
+           const r2 = await attempt('stray->USDC', async () => { const x = await swapTokenToUsdc(stray, tok2.decimals); if (!x || x.ok === false) throw new Error((x && x.error) || 'swap failed'); return x; });
+-          if (r2) { out.straySwapped = Number(stray); await attempt('close token account', () => closeTokenAccounts(tok2)); }
++          if (r2) { out.straySwapped = Number(stray); if (r2.sig) out.sigs.push(r2.sig); await attempt('close token account', () => closeTokenAccounts(tok2)); }
+         }
+       }
+     } catch (e) { out.errors.push('sweep: ' + (e && e.message || e)); log('  sweep failed: ' + (e && e.message || e)); }
+@@ -39,7 +39,7 @@
+   out.solPile = pile;
+   if (pile > SOL_DUST) {
+     const r = await attempt('SOL pile->USDC', async () => { const x = await swapSolToUsdc(BigInt(Math.round(pile * 1e9))); if (!x || x.ok === false) throw new Error((x && x.error) || 'swap failed'); return x; });
+-    if (r) out.solSwapped = pile;
++    if (r) { out.solSwapped = pile; if (r.sig) out.sigs.push(r.sig); }
+   }
+   await sleep(2000);
+   out.usdcAfter = await getUsdcBalance();
+@@ -49,12 +49,12 @@
+ }
+ // SOL capital (== exitSolQuote): only the token goes to SOL; the native SOL pile and the SOL quote side stay in the wallet (capital IS SOL). No USDC leg.
+ async function swapBackSol({ pos, getToken, swapTokenToSol, closeTokenAccounts, getSolBalance, sleep = async () => {}, log = () => {}, retries = 3, canSweepStray = null }) {
+-  const out = { tokenSwapped: 0, straySwapped: 0, errors: [], solBefore: await getSolBalance() };
++  const out = { tokenSwapped: 0, straySwapped: 0, errors: [], sigs: [], solBefore: await getSolBalance() };   // Item 4a: swap sigs, for the close alert
+   const attempt = async (name, fn) => { for (let i = 1; i <= retries; i++) { try { return await fn(); } catch (e) { out.errors.push(`${name} #${i}: ${e.message}`); log(`  ${name} failed (${i}/${retries}): ${e.message}`); await sleep(2000); } } return null; };
+   const tok = await getToken();
+   if (tok && tok.raw > 0n) {
+     const r = await attempt('token->SOL', async () => { const x = await swapTokenToSol(tok.raw, tok.decimals); if (!x || x.ok === false) throw new Error((x && x.error) || 'swap failed'); return x; });
+-    if (r) { out.tokenSwapped = Number(tok.raw); await attempt('close token account', () => closeTokenAccounts(tok)); }
++    if (r) { out.tokenSwapped = Number(tok.raw); if (r.sig) out.sigs.push(r.sig); await attempt('close token account', () => closeTokenAccounts(tok)); }
+     await sleep(3000);
+   }
+   // SWEEP stray dust of this mint (see header): only when the position's own tokens are gone and no other open position shares the mint.
+@@ -66,7 +66,7 @@
+         const stray = tok2 ? (tok2.total != null ? tok2.total : tok2.raw) : 0n;
+         if (stray > 0n) {
+           const r2 = await attempt('stray->SOL', async () => { const x = await swapTokenToSol(stray, tok2.decimals); if (!x || x.ok === false) throw new Error((x && x.error) || 'swap failed'); return x; });
+-          if (r2) { out.straySwapped = Number(stray); await attempt('close token account', () => closeTokenAccounts(tok2)); }
++          if (r2) { out.straySwapped = Number(stray); if (r2.sig) out.sigs.push(r2.sig); await attempt('close token account', () => closeTokenAccounts(tok2)); }
+         }
+       }
+     } catch (e) { out.errors.push('sweep: ' + (e && e.message || e)); log('  sweep failed: ' + (e && e.message || e)); }

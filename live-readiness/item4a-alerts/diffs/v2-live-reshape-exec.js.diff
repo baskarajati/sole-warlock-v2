@@ -1,0 +1,62 @@
+--- pristine-v2/live-reshape-exec.js	2026-11-22 16:54:31.000000000 +0000
++++ patched-v2/live-reshape-exec.js	2026-11-24 16:55:26.715217697 +0000
+@@ -23,13 +23,14 @@
+   if (!(tokenOnChain + (compoundOn ? feeXui : 0) > 0)) return { skipped: 'no token-side inventory or token fees to reshape', ...range };
+   if (!range.ok) return { skipped: 'no room on the right within original position edge', ...range };   // checked BEFORE withdrawing: nothing is taken out
+   const run = async (name, fn) => { let last; for (let i = 1; i <= retries; i++) { try { return await fn(); } catch (e) { last = e; log(`  reshape ${name} failed (${i}/${retries}): ${e.message}`); await sleep(2000); } } throw last; };
++  const sigs = [];   // Item 4a: sigs of the reshape txs, for the reshape alert
+   const tokenBefore = await getTokenRaw();
+   const owner = wallet.publicKey, position = positionKey || pos.position;
+   // 1) claim all fees (token fees feeX and quote fees feeY land in the wallet)
+   const claimTxs = await run('claim', async () => { // the SDK wants the loaded LbPosition object here (it reads position.positionData), not the public key; no fee yet is not an error
+     if (!lbPosition) throw new Error('lbPosition missing');
+     try { const t = await dlmm.claimSwapFee({ owner, position: lbPosition }); return Array.isArray(t) ? t : [t]; } catch (e) { if (/No fee to claim/i.test(e.message)) return []; throw e; } });
+-  for (const [i, tx] of claimTxs.entries()) await run('claim send', () => send(tx, [wallet], `reshape-claim ${i + 1}/${claimTxs.length}`));
++  for (const [i, tx] of claimTxs.entries()) sigs.push(await run('claim send', () => send(tx, [wallet], `reshape-claim ${i + 1}/${claimTxs.length}`)));
+   // live-pnl-fix: the claimed quote fees are now native SOL in the wallet, outside the position. Credit them to THIS position's pile at once
+   // (the compound below takes back exactly what it re-adds), so a failed / skipped compound or a crash in between never drops them from the value.
+   const quoteIsSol = !pos.quoteMint || pos.quoteMint === SOL_MINT;
+@@ -43,7 +44,7 @@
+   if (tokenBins.length) {
+     try {
+       const rm = await run('remove token bins', () => dlmm.removeLiquidity({ user: owner, position, fromBinId: tokenBins[0].binId, toBinId: tokenBins[tokenBins.length - 1].binId, bps: new BN(10000), shouldClaimAndClose: false }));
+-      for (const [i, tx] of rm.entries()) await run('remove send', () => send(tx, [wallet], `reshape-remove ${i + 1}/${rm.length}`));
++      for (const [i, tx] of rm.entries()) sigs.push(await run('remove send', () => send(tx, [wallet], `reshape-remove ${i + 1}/${rm.length}`)));
+     } catch (e) { removeOk = false; errors.push('remove: ' + e.message); log('  ERROR reshape remove failed; measuring what reached the wallet: ' + e.message); }
+   }
+   await sleep(2000);
+@@ -57,7 +58,7 @@
+   let tokenAdded = false;
+   pos.reshapePending = readdRaw > 0n ? { amountRaw: readdRaw.toString(), rightMin: range.rightMin, rightMax: range.rightMax, shape: settings.RESHAPE_SHAPE || 'BIDASK' } : null;   // persisted by the caller: a crash/failure after the withdrawal can resume
+   if (readdRaw > 0n) {
+-    try { await readd({ dlmm, pos, owner, position, StrategyType, BN, wallet, send, run, plan: pos.reshapePending, slippage }); tokenAdded = true; pos.reshapePending = null; subOwned(pos, readdRaw); }
++    try { sigs.push(...(await readd({ dlmm, pos, owner, position, StrategyType, BN, wallet, send, run, plan: pos.reshapePending, slippage })) || []); tokenAdded = true; pos.reshapePending = null; subOwned(pos, readdRaw); }
+     catch (e) { errors.push('token re-add: ' + e.message); log('  ERROR reshape token re-add failed; tokens stay in the wallet, retried next poll: ' + e.message); }
+   }
+   // 3) compound claimed quote fees to the LEFT bins (add only), COMPOUND_SPOT_PCT split like the dry run
+@@ -69,20 +70,22 @@
+         for (const [type, lam, nm] of [[StrategyType.Spot, spotLam, 'spot'], [StrategyType.BidAsk, bidLam, 'bidask']]) {
+           if (!(lam > 0)) continue;
+           const txs = await run('compound add ' + nm, async () => { if (dlmm.refetchStates) await dlmm.refetchStates(); const t = await dlmm.addLiquidityByStrategyChunkable({ positionPubKey: position, totalXAmount: new BN(0), totalYAmount: new BN(lam), strategy: { minBinId: pos.minBinId, maxBinId: activeBinId - 1, strategyType: type }, user: owner, slippage }); return Array.isArray(t) ? t : [t]; });
+-          for (const [i, tx] of txs.entries()) await run('compound send', () => send(tx, [wallet], `reshape-compound-${nm} ${i + 1}/${txs.length}`));
++          for (const [i, tx] of txs.entries()) sigs.push(await run('compound send', () => send(tx, [wallet], `reshape-compound-${nm} ${i + 1}/${txs.length}`)));
+           if (feeYPiled > 0) { const back = Math.min(lam / qDec, Number(pos.leftoverSol) || 0); pos.leftoverSol = (Number(pos.leftoverSol) || 0) - back; pos.feesClaimedToPileSol = Math.max(0, (Number(pos.feesClaimedToPileSol) || 0) - back); }   // this share is in the position now
+         }
+         compounded = feeYui;
+       } catch (e) { errors.push('compound: ' + e.message); log('  ERROR compound failed, fees stay in the wallet pile: ' + e.message); }
+     } else log('  cannot compound quote fees to the left: no bins below active (dry run would extend the position lower; live keeps the fees in the pile)');
+   }
+-  return { ok: removeOk && (tokenAdded || readdRaw === 0n), tokenAdded, compounded, feeYPiled, errors, range, amountX: Number(readdRaw) / 10 ** decX, feeXAdded: compoundOn ? feeXui : 0, txs: txsGuess, txCost: txsGuess * txFee, tokenBins: tokenBins.length };
++  return { ok: removeOk && (tokenAdded || readdRaw === 0n), tokenAdded, compounded, feeYPiled, errors, range, amountX: Number(readdRaw) / 10 ** decX, feeXAdded: compoundOn ? feeXui : 0, txs: txsGuess, txCost: txsGuess * txFee, tokenBins: tokenBins.length, sigs };
+ }
+ function subOwned(pos, raw) { if (pos.walletTokenRaw == null) return; const v = BigInt(pos.walletTokenRaw) - BigInt(raw); pos.walletTokenRaw = (v > 0n ? v : 0n).toString(); }
+ async function readd({ dlmm, owner, position, StrategyType, BN, wallet, send, run, plan, slippage }) {
+   const type = plan.shape === 'SPOT' ? StrategyType.Spot : StrategyType.BidAsk;
+   const txs = await run('token add', async () => { if (dlmm.refetchStates) await dlmm.refetchStates(); /* fresh active bin after claim/remove: a stale one gave ExceededBinSlippageTolerance */ const t = await dlmm.addLiquidityByStrategyChunkable({ positionPubKey: position, totalXAmount: new BN(plan.amountRaw), totalYAmount: new BN(0), strategy: { minBinId: plan.rightMin, maxBinId: plan.rightMax, strategyType: type }, user: owner, slippage: Math.max(Number(slippage) || 0, 5) })   /* token-only add above the active bin: the active bin moving a little must not abort it (ExceededBinSlippageTolerance) */; return Array.isArray(t) ? t : [t]; });
+-  for (const [i, tx] of txs.entries()) await run('token add send', () => send(tx, [wallet], `reshape-add-token ${i + 1}/${txs.length}`));
++  const sigs = [];
++  for (const [i, tx] of txs.entries()) sigs.push(await run('token add send', () => send(tx, [wallet], `reshape-add-token ${i + 1}/${txs.length}`)));
++  return sigs;
+ }
+ // Resume a re-add that was interrupted after the withdrawal (position keeps reshapePending until it succeeds).
+ async function resumePending(args) {

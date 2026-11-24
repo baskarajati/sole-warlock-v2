@@ -1,0 +1,224 @@
+--- pristine-v2/telegram-notify.js	2026-11-22 16:54:31.000000000 +0000
++++ patched-v2/telegram-notify.js	2026-11-24 16:54:29.980714057 +0000
+@@ -24,7 +24,7 @@
+ const MAX_QUEUE = 25;
+ const ERROR_COOLDOWN_MS = 5 * 60 * 1000;
+ const IS_LIVE = process.env.DRY_RUN === '0' && process.env.PAPER !== '1';
+-const PREFIX = IS_LIVE ? '[LIVE]' : '[DRY RUN]';   // liveWording() rewrites it to [LIVE] in chat while the LIVE button is on
++const PREFIX = IS_LIVE ? '[LIVE-v2]' : '[DRY RUN]';   // Item 4a: v1 and v2 live alerts were indistinguishable in chat (both '[LIVE]')
+ // Recipient authorization comes from .env; there is no built-in recipient.
+ const TUAN_TG_ID = Number(process.env.TELEGRAM_ALLOWED_ID || process.env.TELEGRAM_CHAT_ID || 0);
+ const { botWalletAddress } = require('./bot-wallet-address');
+@@ -323,9 +323,35 @@
+   return t.replace(/\[DRY RUN\]/g, '[LIVE]').replace(/\bREAL DRY RUN\b/g, 'LIVE RUN').replace(/\b(dry[ -]?run|paper)\b(?![\/.\w-])/gi, (m) => (m === m.toUpperCase() ? 'LIVE' : /^[A-Z]/.test(m) ? 'Live' : 'live'));
+ }
+ 
++// Item 4a: every send outcome is appended to <instance-root>/alerts.jsonl so the
++// 6-hourly check can read the last-alert timestamp (the notifier previously kept
++// no record at all — a dead Telegram path was invisible). Best-effort only: this
++// must never break alerting. Rotated at ~200KB (keeps the last 1000 lines).
++const ALERT_LOG_FILE = process.env.TELEGRAM_ALERT_LOG_FILE || path.join(ROOT, 'alerts.jsonl');
++function recordAlertOutcome(res) {
++  try {
++    const line = JSON.stringify({ ts: new Date().toISOString(), ok: !!(res && res.ok), error: (res && res.error) || null, skipped: (res && res.skipped) || null, messageId: (res && res.messageId) || null }) + '\n';
++    fs.appendFileSync(ALERT_LOG_FILE, line);
++    try {
++      if (fs.statSync(ALERT_LOG_FILE).size > 200000) {
++        const lines = fs.readFileSync(ALERT_LOG_FILE, 'utf8').trim().split('\n');
++        fs.writeFileSync(ALERT_LOG_FILE, lines.slice(-1000).join('\n') + '\n');
++      }
++    } catch { /* rotation is best-effort */ }
++  } catch { /* alert logging must never break alerting */ }
++}
++function lastAlert() {
++  try {
++    const lines = fs.readFileSync(ALERT_LOG_FILE, 'utf8').trim().split('\n').filter(Boolean);
++    if (!lines.length) return null;
++    return JSON.parse(lines[lines.length - 1]);
++  } catch { return null; }
++}
++
+ function send(text, opts = {}) {
+   text = liveWording(botI18n.trText(botI18n.getLang(ROOT), text));   // English chat: translate the notification text
+   if (queueLen >= MAX_QUEUE) {
++    recordAlertOutcome({ ok: false, skipped: 'notify queue full' });
+     return Promise.resolve({ ok: false, skipped: 'notify queue full' });
+   }
+   queueLen += 1;
+@@ -334,6 +360,7 @@
+     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+     let res = await postSendMessage(text, opts);
+     if (opts.parse_mode && res && !res.ok && /parse entities|can't parse|unsupported start tag/i.test(String(res.error || ''))) { const { parse_mode, ...o } = opts; res = await postSendMessage(tgFormat.stripHtml(text), o); }   // bad HTML: plain text, never lose the message
++    recordAlertOutcome(res);
+     lastSentAt = Date.now();
+     return res;
+   }).catch((e) => ({ ok: false, error: redact(e && e.message) }))
+@@ -442,6 +469,7 @@
+     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+     let res = await postSendPhoto(caption, png, opts);
+     if (opts.parse_mode && res && !res.ok && /parse entities|can't parse|unsupported start tag/i.test(String(res.error || ''))) { const { parse_mode, ...o } = opts; res = await postSendPhoto(tgFormat.stripHtml(caption), png, o); }
++    recordAlertOutcome(res);
+     lastSentAt = Date.now();
+     return res;
+   }).catch((e) => ({ ok: false, error: redact(e && e.message) }))
+@@ -682,8 +710,18 @@
+   return sendCardOrText(html, card, e, { reply_markup: poolKeyboard(e.pool) }).catch(() => ({ ok: false, error: 'notify failed' }));
+ }
+ 
+-// Reshape is SILENT (operator t238u: too noisy): no card, no text, live or dry run. Only reposition + failed-reopen alerts are sent.
+-function notifyReshape() { return Promise.resolve({ ok: false, skipped: 'reshape notifications are off' }); }
++// Item 4a: reshape alert, re-enabled as a real implementation (tg-format.reshapeHtml
++// already existed; the stub returned 'reshape notifications are off'). The SILENCE
++// decision (operator t238u: too noisy) is preserved by the caller: bot.js only calls
++// this when CFG.NOTIFY_RESHAPE === true (default false). Flip the flag to re-enable.
++// The old test test-tg-reposition-notify.js asserts reshape silence and must be
++// updated by QC when the flag is flipped.
++function notifyReshape(e = {}) {
++  const lang = htmlLang(), paper = isPaperRec(e);
++  const html = withNote(tgFormat.reshapeHtml(e, { lang, paper }));
++  let card = null; try { card = warlockCard.eventCardData({ ...e, paper }, 'reshape', { lang }); } catch { card = null; }
++  return sendCardOrText(html, card, e, { reply_markup: poolKeyboard(e.pool) }).catch(() => ({ ok: false, error: 'notify failed' }));
++}
+ 
+ function notifyReposition(e = {}) {
+   const lang = htmlLang(), paper = isPaperRec(e);
+@@ -738,6 +776,51 @@
+   return sendCloseCard(rec, { emergency: true }).catch(() => ({ ok: false, error: 'notify failed' }));
+ }
+ 
++// Item 4a: kill-switch event alert (STOP / NO_NEW seen by the live cycle).
++// The per-position closes alert separately with reason 'STOP file'; this is the
++// event-level alert. Called once per episode by bot.js (state flags).
++function notifyKillSwitch({ kind = 'STOP', openCount = 0, positions = [] } = {}) {
++  const lines = [
++    `🛑 ${PREFIX} Kill switch: ${kind} ditulis.`,
++    '',
++    `Posisi terbuka saat ini: ${openCount}${positions.length ? ' (' + positions.join(', ') + ')' : ''}`,
++    kind === 'STOP'
++      ? 'Posisi ditutup lewat jalur normal (alasan STOP file); proses berhenti setelah flat.'
++      : 'Tidak ada posisi baru dibuka; posisi terbuka tetap dikelola sampai exit normal.',
++    `Waktu: ${wib()}`,
++  ];
++  return fire(lines.join('\n'));
++}
++
++// Item 4a: halt / circuit-breaker trip (and manual reset) alert.
++// This function ONLY sends the alert. The trip detection, latch, STOP/NO_NEW
++// writes and reset procedure are Item 1 (plan §3.1) — Item 1 calls this at its
++// trip point with { criterion, figures }; see CALL-SITE-MAP.md §5 for the exact
++// insertion points. Until Item 1 lands, this function has no caller.
++function notifyHalt({ criterion = '?', figures = '', reset = false } = {}) {
++  const lines = [
++    reset ? `✅ ${PREFIX} Halt ${criterion} di-RESET manual.` : `🛑 ${PREFIX} HALT trip: ${criterion}.`,
++    '',
++    figures ? `Angka: ${figures}` : '',
++    reset ? 'Open baru diizinkan lagi setelah reset ini.' : 'STOP / NO_NEW ditulis oleh kode halt; tidak ada open baru sampai reset manual.',
++    `Waktu: ${wib()}`,
++  ].filter(Boolean);
++  return fire(lines.join('\n'));
++}
++
++// Item 4a: feed-degradation reporting alert (3 consecutive stale SOL/USD reads).
++// Reporting only: the no-open rule + NO_NEW write are Item 1 (plan §3.1.7).
++function notifyFeedDegraded({ stalePollsConsecutive = 0, coingecko429 = 0, jupiter429 = 0, lastFreshPriceAt = null } = {}) {
++  const lines = [
++    `⚠️ ${PREFIX} Feed-degraded: harga SOL/USD stale ${stalePollsConsecutive} poll berturut-turut.`,
++    '',
++    `CoinGecko 429/jam: ${coingecko429} · Jupiter 429/jam: ${jupiter429}`,
++    lastFreshPriceAt ? `Harga segar terakhir: ${lastFreshPriceAt}` : 'Belum ada harga segar.',
++    'Ini alert pelaporan (Item 4a). Aturan no-open-on-stale-feed + NO_NEW adalah Item 1 — belum aktif.',
++  ];
++  return fire(lines.join('\n'));
++}
++
+ function notifyError(err, kind = 'error') {
+   const key = kind + ':' + redact(err && (err.message || err)).slice(0, 80);
+   const now = Date.now();
+@@ -751,12 +834,24 @@
+     `⚠️ ${PREFIX} Bot ${kind}.`,
+     '',
+     brief || '(tidak ada detail)',
+-    kind === 'cycle error' ? 'Masih jalan, retry ~15 detik. Live tidak dijalankan.' : 'Cek log paper/bot.log. Live tidak dijalankan.',
++    kind === 'cycle error' ? 'Masih jalan, retry ~15 detik.' + (IS_LIVE ? '' : ' Live tidak dijalankan.') : (IS_LIVE ? 'Cek log bot.log.' : 'Cek log paper/bot.log. Live tidak dijalankan.'),
+   ].join('\n');
+   return fire(text);
+ }
+ 
+ function notifyStartup(status = {}) {
++  if (status.live) {
++    const lines = [
++      `🤖 ${PREFIX} Bot LP Warlock 2.0 LIVE dimulai`,
++      '',
++      status.wallet ? `Wallet: ${status.wallet}` : '',
++      `📌 Posisi terbuka: ${status.openCount || 0}`,
++      status.pnlTotalUsd != null ? `Realisasi kumulatif: ${fmtUsd(status.pnlTotalUsd)}` : '',
++      `STOP: ${status.stopPresent ? 'ADA — live terkunci sampai STOP dilepas' : 'tidak ada'}`,
++      `Waktu: ${wib()}`,
++    ].filter(Boolean);
++    return fire(lines.join('\n'));
++  }
+   const pos = status.position;
+   const scan = status.lastScan;
+   const rej = scan && scan.rejects ? Object.entries(scan.rejects).map(([k, v]) => `${k} ${v}`).join(', ') : '';
+@@ -823,6 +918,43 @@
+   process.on('unhandledRejection', once('crash (unhandled rejection)'));
+ }
+ 
++// Item 4a: daily-heartbeat / startup status for the LIVE instance. The paper
++// statusFromState reads state.books.N5, which a live state does not have —
++// passing a live state to it would report zero trades and zero PnL. Live state
++// is positions[] + history[]; realised P&L is the sum of history pnlUsd.
++// todayAgg reuses pnl-period.aggregate (same builder as the 07:00 daily card).
++// feesPaidUsd is null by design (gap G-6: live rows record no swap/gas costs).
++// equityUsd is null (live open positions are not valued here — the heartbeat
++// reports realised PnL + open count, not a marked equity).
++function statusFromLiveState(state, extra = {}) {
++  const hist = (state && state.history) || [];
++  const positions = Array.isArray(state && state.positions) ? state.positions
++    : (state && state.position ? [state.position] : []);
++  let todayAgg = null;
++  try { todayAgg = require('./pnl-period').aggregate(hist, 'day', 0, { solUsd: extra.solUsd || null }); } catch { todayAgg = null; }
++  const sumUsd = (rows) => rows.reduce((s, h) => s + (+(h.pnlUsd != null ? h.pnlUsd : h.netPnlUsd) || 0), 0);
++  const sumSol = (rows) => rows.reduce((s, h) => s + (h.capitalAsset === 'SOL' ? (+(h.pnlCapital != null ? h.pnlCapital : h.netPnlSol) || 0) : 0), 0);
++  return {
++    live: true,
++    startedWib: null, endsWib: null,
++    capitalAsset: 'SOL', freeCapitalSol: null, equitySol: null, equityUsd: null,
++    totalDepositedUsdc: null, virtualUsdc: null, leftoverSol: null,
++    positions: positions.map((p) => ({ capitalAsset: p.capitalAsset || 'USDC', name: p.name, pool: p.pool, entryWib: p.entryWib })),
++    quotePnlTotals: { usd: null, quotes: {} },
++    openCount: positions.length, maxPositions: extra.maxPositions || 5,
++    trades: hist.length, tradesToday: todayAgg ? todayAgg.trades : 0,
++    pnlToday: todayAgg ? todayAgg.pnlSol : null, pnlTotal: sumSol(hist),
++    pnlTodayUsd: todayAgg ? todayAgg.pnlUsd : null, pnlTotalUsd: sumUsd(hist),
++    realizedPnlTotalUsd: sumUsd(hist),
++    todayAgg,
++    feesPaidUsd: null,
++    feedHealth: extra.feedHealth || null,
++    stopPresent: !!extra.stopPresent,
++    wallet: extra.wallet || null,
++    solUsd: extra.solUsd || null,
++  };
++}
++
+ function statusFromState(state, extra = {}) {
+   const book = state && state.books && (state.books.N5 || Object.values(state.books)[0]);
+   const positions=book?.positions||(book?.position?[book.position]:[]);
+@@ -1048,6 +1180,11 @@
+   notifyRestart,
+   notifyDailySummary,
+   notifyWindowEnd,
++  notifyKillSwitch,
++  notifyHalt,
++  notifyFeedDegraded,
++  statusFromLiveState,
++  lastAlert,
+   maybeDailySummary,
+   dailyDue,
+   installProcessHandlers,
+@@ -1058,4 +1195,5 @@
+   loadToken,
+   SECRET_FILE,
+   CFG_FILE,
++  ALERT_LOG_FILE,
+ };
