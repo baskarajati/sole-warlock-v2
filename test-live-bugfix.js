@@ -40,8 +40,9 @@ const fnBody = (name) => { const i = src.indexOf(name); assert.ok(i >= 0, name);
   await t('H1 isAccountMissing recognises SDK / RPC "missing" errors only', () => { assert.ok(S.isAccountMissing(new Error('Account does not exist 7xKX'))); assert.ok(!S.isAccountMissing(new Error('429 Too Many Requests'))); });
   // ---------- H2 ----------
   await t('H2 send(): status-poll RPC errors keep polling (no false "not sent"); signature handed to the caller before confirmation', () => {
-    const c = fnBody('async function send(');
-    assert.ok(/opts\.onSig/.test(c)); assert.ok(/catch \(e\) \{[^\n]*\n[^\n]*180_000/.test(c)); assert.ok(/err\.sig = sig/.test(c));
+    const c = fnBody('async function send('), loop = fnBody('async function confirmRaw(');   // review fix: the loop moved to confirmRaw (shared with the Jupiter swaps)
+    assert.ok(/opts\.onSig/.test(c)); assert.ok(/await confirmRaw\(raw, sig, label, lastValidBlockHeight\)/.test(c));
+    assert.ok(/catch \(e\) \{[^\n]*\n[^\n]*180_000/.test(loop)); assert.ok(/err\.sig = sig/.test(loop));
   });
   await t('H2 open: planned position kept in state.pendingOpens before the first send; an error with the account on chain is recorded and booked', () => {
     const c = fnBody('async function openDepositTracked');

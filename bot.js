@@ -1936,6 +1936,14 @@ async function send(tx, signers, label, opts = {}) {
   const raw = tx.serialize();
   const sig = await conn.sendRawTransaction(raw, { maxRetries: 5 });
   if (typeof opts.onSig === 'function') { try { await opts.onSig(sig); } catch { /* bookkeeping hook must never break the send */ } }   // H1/M2: the caller records the signature before confirmation
+  await confirmRaw(raw, sig, label, lastValidBlockHeight);
+  log(`  tx ${label} confirmed ${sig}`);
+  return sig;
+}
+// Review fix (24 Nov 2026): the confirm loop of send(), shared with the Jupiter swaps (they used a single confirmTransaction, so a
+// swap could land and still throw, and a retry then swapped the same SOL again). Throws err.sig on expiry, err.sig + err.unknownStatus
+// when the status cannot be read, err.sig + err.failedOnChain when the transaction landed with an error (nothing moved).
+async function confirmRaw(raw, sig, label, lastValidBlockHeight) {
   // Keep re-broadcasting the SAME signed transaction every ~1.5 s until it is confirmed or its blockhash expires: a single send is often dropped under load (that is what produced 'block height exceeded').
   const t0 = Date.now();
   for (;;) {
@@ -1945,7 +1953,7 @@ async function send(tx, signers, label, opts = {}) {
       if (Date.now() - t0 > 180_000) { const err = new Error(`${label}: status of ${sig} unknown after 180 s (${e.message})`); err.sig = sig; err.unknownStatus = true; throw err; }
       await sleep(2000); continue;
     }
-    if (st && st.err) throw new Error(`${label} failed ${sig} ${JSON.stringify(st.err)}`);
+    if (st && st.err) { const err = new Error(`${label} failed ${sig} ${JSON.stringify(st.err)}`); err.sig = sig; err.failedOnChain = true; throw err; }
     if (st && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) break;
     let bh = 0; try { bh = await conn.getBlockHeight('confirmed'); } catch { /* ignore */ }
     if (bh > lastValidBlockHeight) { const st2 = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0]; if (st2 && !st2.err && st2.confirmationStatus) break; const err = new Error(`Signature ${sig} has expired: block height exceeded.`); err.sig = sig; throw err; }
@@ -1953,7 +1961,6 @@ async function send(tx, signers, label, opts = {}) {
     try { await conn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }); } catch { /* already known / dropped: keep trying */ }
     await sleep(1500);
   }
-  log(`  tx ${label} confirmed ${sig}`);
   return sig;
 }
 
@@ -2264,10 +2271,8 @@ async function liveSwapAllToSol(mintX) {
   if (CFG.DRY_RUN || CFG.PAPER || process.env.LIVE_CONFIRMED !== '1') return;
   const s = await jupGetJSON('https://lite-api.jup.ag/swap/v1/swap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ quoteResponse: { ...q, inAmount: String(q.inAmount), outAmount: String(q.outAmount) },   /* parseQuote turned the amounts into numbers: the Jupiter API answers 422 unless they are strings */ ...swapRoute.swapBodyParams(q), userPublicKey: wallet.publicKey.toBase58(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: 'auto' }) });
   const vtx = VersionedTransaction.deserialize(Buffer.from(s.swapTransaction, 'base64')); vtx.sign([wallet]);
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-  const sig = await conn.sendRawTransaction(vtx.serialize(), { maxRetries: 5 });
-  const c = await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
-  if (c.value.err) throw new Error('jupiter swap failed ' + sig); log('  tx jupiter-swap confirmed ' + sig);
+  const sig = await sendSwapTx(vtx, s, 'jupiter-swap');   // review fix: robust confirm (was a single confirmTransaction)
+  if (sig && sig.notLanded) throw new Error('jupiter swap failed ' + sig.sig + ': ' + sig.reason); log('  tx jupiter-swap confirmed ' + sig);
   try {
     for (const a of accs.value) {
       const tx = new Transaction().add(createCloseAccountInstruction(a.pubkey, wallet.publicKey, wallet.publicKey, [], a.account.owner));
@@ -2578,6 +2583,27 @@ async function liveUsdcBal(pk) {
   return Number(raw) / 1e6;
 }
 
+// Review fix (24 Nov 2026): send a signed Jupiter swap through the send() confirm loop (re-broadcast + status poll + history check).
+// The blockhash is Jupiter's, so its lastValidBlockHeight comes from the /swap answer; the fetched height is only a fallback (a later
+// height just waits longer, the history check still decides). A failed simulation or an on-chain error is returned as { notLanded }
+// (nothing moved);
+// an unknown status still throws with err.sig, so the caller re-reads the balance before any retry (live-close-exec maybeSent).
+async function sendSwapTx(vtx, swapAnswer, label) {
+  if (CFG.PAPER || CFG.DRY_RUN || process.env.LIVE_CONFIRMED !== '1') throw new Error('sendSwapTx() blocked: paper/dry-run or LIVE_CONFIRMED missing');
+  let lvbh = Number(swapAnswer && swapAnswer.lastValidBlockHeight);
+  if (!(lvbh > 0)) lvbh = (await conn.getLatestBlockhash()).lastValidBlockHeight;
+  const raw = vtx.serialize();
+  const sig = bs58.encode(vtx.signatures[0]);
+  try { await conn.sendRawTransaction(raw, { maxRetries: 5 }); }
+  catch (e) {
+    // A failed simulation (slippage, no funds) means the RPC did not forward the transaction: nothing moved, report it now.
+    if (/simulation failed|preflight/i.test(String(e && e.message))) return { notLanded: true, sig, reason: e.message };
+    log(`  ${label}: first send failed (${e.message}); polling ${sig}`);   // a network error may still have forwarded it
+  }
+  try { await confirmRaw(raw, sig, label, lvbh); }
+  catch (e) { if (e.failedOnChain) return { notLanded: true, sig, reason: e.message }; e.sig = e.sig || sig; throw e; }
+  return sig;
+}
 async function jupiterSwapLive(inputMint, outputMint, rawAmount, inDec, outDec, label, slippageBps = 300) {
   const raw = typeof rawAmount === 'bigint' ? rawAmount : BigInt(Math.max(0, Math.floor(Number(rawAmount) || 0)));
   if (raw === 0n) return { ok: true, skipped: 'zero', inUi: 0, outUi: 0 };
@@ -2602,10 +2628,8 @@ async function jupiterSwapLive(inputMint, outputMint, rawAmount, inDec, outDec, 
   });
   const vtx = VersionedTransaction.deserialize(Buffer.from(s.swapTransaction, 'base64'));
   vtx.sign([wallet]);
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-  const sig = await conn.sendRawTransaction(vtx.serialize(), { maxRetries: 5 });
-  const c = await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
-  if (c.value.err) throw new Error(`${label} swap failed`);
+  const sig = await sendSwapTx(vtx, s, `jupiter-${label}`);
+  if (sig && sig.notLanded) return { ok: false, error: `${label} swap not landed: ${sig.reason}`, sig: sig.sig };   // nothing moved: a retry is safe
   log(`  tx jupiter-${label} confirmed ${sig}`);
   return { ok: true, inUi: q.inUi, outUi: q.outUi, sig };
 }
