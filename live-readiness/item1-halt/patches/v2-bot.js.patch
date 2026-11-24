@@ -1,0 +1,193 @@
+--- a/bot.js
++++ b/bot.js
+@@ -61,8 +61,13 @@
+ const slBlacklist=require('./paper-sl-blacklist');
+ const walletStore = require('./wallet-store');
+ const liveControl = require('./live-control');
++const liveHalt = require('./live-halt');   // Item 1: per-book safety-halt enforcement (K1-K8, latch, feed rules)
+ 
+ const DIR = process.env.LP_BOT_DIR || '/workspace/lp-bot';
++// Item 1 (halt): one instance per process. Reads thresholds from
++// <DIR>/halt-params.json (D-0c table) when present, else D-0c Rev 1 defaults.
++// v2 pays the disclosed 50 bps Jupiter referral fee: maxFeeBps 50.
++const halt = liveHalt.create({ dir: DIR, bot: 'v2', log, notifyEmergency: (rec) => telegram.notifyEmergency(rec), maxFeeBps: 50 });
+ const PAPER_DIR = path.join(DIR, 'paper');
+ const historyArchivePolicy=entryPolicy.readArchivePolicy(PAPER_DIR);
+ let lastArchiveCount=-1;
+@@ -125,6 +130,7 @@
+   MAX_DEV_HOLD: +(process.env.MAX_DEV_HOLD || 0.10),
+   // Live reshape remains opt-in (RESHAPE=1). Paper always runs the shadow variant set below.
+   RESHAPE: process.env.RESHAPE === '1',
++  RESHAPE_MAX: +(process.env.RESHAPE_MAX || 5),   // Item 1: per-leg reshape cap (closes OPEN-3); settings.json wins via applyPaperSettings
+   PAPER_VIRTUAL_SOL: +(process.env.PAPER_VIRTUAL_SOL || 5.30),
+   PAPER_USDC: +(process.env.PAPER_USDC || paperCap.DEFAULT_USDC_START),
+   USDC_BUFFER: +(process.env.USDC_BUFFER || paperCap.DEFAULT_USDC_BUFFER),
+@@ -238,12 +244,12 @@
+   try {
+     const j = await getJSON('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {}, 2);
+     const px = +j?.solana?.usd;
+-    if (px > 0) { solUsdCache = { t: Date.now(), px }; return px; }
++    if (px > 0) { solUsdCache = { t: Date.now(), px }; halt.noteSolUsdAt(Date.now(), px); return px; }   // Item 1: feed freshness for the stale-feed rule + last-good price for the N1 conversion / N2 close fallback
+   } catch (e) { log('coingecko sol usd: ' + e.message); }
+   try {
+     const j = await getJSON('https://api.dexscreener.com/latest/dex/tokens/' + SOL, {}, 2);
+     const px = +(j?.pairs?.[0]?.priceUsd || 0);
+-    if (px > 0) { solUsdCache = { t: Date.now(), px }; return px; }
++    if (px > 0) { solUsdCache = { t: Date.now(), px }; halt.noteSolUsdAt(Date.now(), px); return px; }   // Item 1: feed freshness for the stale-feed rule + last-good price for the N1 conversion / N2 close fallback
+   } catch (e) { log('dexscreener sol usd: ' + e.message); }
+   return solUsdCache.px || 0;
+ }
+@@ -2019,6 +2025,17 @@
+ async function liveOpen(p, state, opts = {}) {
+   // Same open-time guards as the dry run (paperOpenSingle / paperOpenUsdc); nothing has been sent yet when any of them rejects.
+   const policy = { ...CFG, ...(opts.strategySettings || {}) };   // a reposition keeps the settings the position was opened with, like paperOpenSingle
++  // Item 1 (halt): THE choke point. Every open route — scan cycle, manual
++  // open (liveManualOpen), reposition openNew — funnels through liveOpen(),
++  // so no route bypasses this check. Refuses before any chain call is made.
++  {
++    const gate = halt.checkGate({ paper: CFG.PAPER, dryRun: CFG.DRY_RUN, liveConfirmed: process.env.LIVE_CONFIRMED === '1' });
++    if (!gate.ok) return { skipped: gate.reason };
++    const fee = halt.checkFeeBps(swapRoute.ROUTE_FEE_BPS, 'open');
++    if (!fee.ok) return { skipped: fee.reason };
++    const open = halt.refuseOpen(Date.now(), { scanAt: state.lastScan && state.lastScan.at ? Date.parse(state.lastScan.at) : null, pollSec: CFG.POLL_SEC, stopPresent: fs.existsSync(path.join(DIR, 'STOP')), noNewPresent: fs.existsSync(path.join(DIR, 'NO_NEW')) });
++    if (!open.ok) { log('OPEN ditolak ' + p.name + ': ' + open.reason); return { skipped: open.reason }; }
++  }
+   if (opts.source !== 'reposition' && CFG.SL_BLACKLIST_ENABLED !== false && slBlacklist.has(PAPER_DIR, p.token_x?.address)) { log('OPEN ditolak ' + p.name + ': SL blacklist'); return { skipped: 'SL blacklist: token pernah kena stop loss' }; }
+   { const why = entryPolicy.cooldownReason(state.history || [], p.address, CFG.REOPEN_COOLDOWN_MIN); if (why) { log('OPEN ditolak ' + p.name + ': ' + why); return { skipped: why }; } }
+   if (CFG.MAX_LIQ_USD > 0 && p.tvl > CFG.MAX_LIQ_USD) { const why = `tvl>$${CFG.MAX_LIQ_USD}`; log('OPEN ditolak ' + p.name + ': ' + why); return { skipped: why }; }
+@@ -2344,6 +2361,39 @@
+   if (!opts.intermediate && slBlacklist.isStopLoss(reason)) { try { if (slBlacklist.add(PAPER_DIR, { mint: pos.mintX, symbol: pos.name, pool: pos.pool, reason, closedAt: now(), source: 'auto' })) log('SL blacklist add ' + pos.name + ' ' + pos.mintX); } catch (e) { log('SL blacklist add failed: ' + e.message); } }
+   clearCloseMarks(pos);
+   const row = { ...pos, closedAt: now(), reason, estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +realized.toFixed(5), usdcIn: basisUsdc, usdcOut: sb.usdcOut, legUsdcIn: pos.usdcIn, legUsdcOut: sb.usdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, pnlCapital: pnlUsd, pnlCapitalPct: pnlPct, solPile: sb.solPile, swapBackComplete: sb.complete, swapBackErrors: sb.errors };
++  // Item 1 (§3.1.7 + K1/K3-K8): flag on-chain-estimate exits in the row
++  // (liveNotifyClose below renders the row, so the flag reaches the alert)
++  // and feed the close into the halt accounting. Intermediate reposition
++  // legs are excluded (the final close carries the leg PnL).
++  if (opts.valuation) { row.quoted = !!opts.valuation.quoted; row.valuationBasis = opts.valuation.basis || null; if (!opts.valuation.quoted) log(`  CLOSE ${pos.name}: exit on on-chain estimate (quoted=false, basis=${row.valuationBasis}) — flagged in history row`); }
++  if (!opts.intermediate) {
++    // Item 1 (N2 fix): never skip halt accounting for a missing price.
++    // solUsd() already returns its last-good cached price; if even that
++    // is 0, fall back to the last-good price the halt module remembers
++    // (persisted in halt-state.json, so it survives a restart mid-outage).
++    // Only when no SOL price was ever seen is pnlSol booked as 0 — the
++    // leg is still counted (closedLegs / K3 / K4 / K5 / K7 all see it)
++    // and the row is flagged priceFallback. A price older than the 60 s
++    // solUsd cache window is flagged too.
++    // Item 1 (N3 fix): realisedSol must be the USDC actually realised
++    // FROM THE POSITION. sb.usdcOut also contains the sale of the
++    // out-of-position SOL pile (leftover gas reserve + refunded rent),
++    // so subtract those pile components — otherwise the K8 gap carries a
++    // systematic positive bias of leftoverSol + rent refund against a
++    // 0.0625 SOL threshold. Close fees inside receivedSol stay in (they
++    // shrink the gap slightly — the safe direction). No gap observation
++    // when the swap-back is incomplete (partial fills — and the
++    // pending-token estimate added to sb.usdcOut — are not a quote-vs-fill
++    // observation) or when no price exists.
++    const pxHalt = (await solUsd().catch(() => 0)) || halt.lastSolUsdPx() || 0;
++    const priceFallback = pxHalt === 0 || (Date.now() - solUsdCache.t >= 60_000);
++    if (priceFallback) { row.priceFallback = true; log(`  CLOSE ${pos.name}: halt accounting on ${pxHalt === 0 ? 'NO SOL/USD price ever seen (pnlSol booked as 0 — leg still counted)' : 'fallback SOL price $' + pxHalt.toFixed(2)} — row flagged priceFallback`); }
++    const pileOutsideSol = (pos.leftoverSol || 0) + (pos.rentRefundableSol || 0);
++    const gap = (pxHalt > 0 && sb.complete)
++      ? { quotedSol: pos.quoteMint === USDC ? v.value / pxHalt : v.value, realisedSol: sb.usdcOut / pxHalt - pileOutsideSol }
++      : { quotedSol: null, realisedSol: null };
++    halt.recordClose({ pnlSol: pxHalt > 0 ? pnlUsd / pxHalt : 0, legSol: pxHalt > 0 ? (pos.quoteMint === USDC ? (pos.depositQuote ?? pos.usdcIn ?? 0) / pxHalt : (pos.depositSol || 0)) : undefined, reason, pool: pos.pool, openedAt: pos.openedAt, quotedSol: gap.quotedSol, realisedSol: gap.realisedSol, feeBps: swapRoute.ROUTE_FEE_BPS });
++  }
+   row.binShape = liveRowBins(pos); delete row.liveBins;   // closed rows keep the compact snapshot (PnL card bins), not the live chart model
+   if (pendingTokenEstimateUsdc > 0) { row.pendingTokenEstimateUsdc = pendingTokenEstimateUsdc; row.swapBackEstimated = true; const ps = state.pendingSells[state.pendingSells.length - 1]; if (ps && ps.row) ps.row.closedAt = row.closedAt; }
+   if (!opts.intermediate) { state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json')); }
+@@ -2390,6 +2440,29 @@
+   if (!opts.intermediate && slBlacklist.isStopLoss(reason)) { try { if (slBlacklist.add(PAPER_DIR, { mint: pos.mintX, symbol: pos.name, pool: pos.pool, reason, closedAt: now(), source: 'auto' })) log('SL blacklist add ' + pos.name + ' ' + pos.mintX); } catch (e) { log('SL blacklist add failed: ' + e.message); } }
+   clearCloseMarks(pos);
+   const row = { ...pos, closedAt: now(), reason, estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +(solOut - capIn).toFixed(5), capitalAsset: 'SOL', solOut, solUsd: px, usdcIn: basisUsdc, usdcOut: basisUsdc + pnlUsd, legUsdcIn: pos.usdcIn, legUsdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, netPnlSol: pnlCapital, pnlCapital, pnlCapitalPct: pnlPct, solPile: solOut, swapBackComplete: sb.complete, swapBackErrors: sb.errors };
++  // Item 1 (§3.1.7 + K1/K3-K8): SOL-capital path — PnL is natively SOL.
++  if (opts.valuation) { row.quoted = !!opts.valuation.quoted; row.valuationBasis = opts.valuation.basis || null; if (!opts.valuation.quoted) log(`  CLOSE ${pos.name}: exit on on-chain estimate (quoted=false, basis=${row.valuationBasis}) — flagged in history row`); }
++  // Item 1 (N3 fix): solOut is the position's own SOL pile PLUS the
++  // out-of-position pile (leftover gas reserve + refunded rent), while
++  // quotedSol (v.value) is the position only — subtract the pile
++  // components so the K8 gap compares like with like. No gap observation
++  // when the swap-back is incomplete (solOut then contains the
++  // pending-token estimate, not a fill).
++  if (!opts.intermediate) {
++    const pileOutsideSol = (pos.leftoverSol || 0) + (pos.rentRefundableSol || 0);
++    const gap = sb.complete
++      ? { quotedSol: v.value, realisedSol: solOut - pileOutsideSol }
++      : { quotedSol: null, realisedSol: null };
++    halt.recordClose({ pnlSol: pnlCapital, legSol: basisSol, reason, pool: pos.pool, openedAt: pos.openedAt, quotedSol: gap.quotedSol, realisedSol: gap.realisedSol, feeBps: swapRoute.ROUTE_FEE_BPS });
++    // Item 1 (N3): liveCloseSol is only reachable with capitalAsset SOL,
++    // which implies quoteMint SOL (liveOpen sets both together; solMode
++    // rejects non-SOL pools). Assert it here: a mismatch means the
++    // position record is internally inconsistent and the SOL-native gap
++    // above cannot be trusted. Trip K8 (fail-closed) AFTER the close is
++    // counted, so a real K1 on this leg keeps latch priority; the breach
++    // is always in the log line either way.
++    if (pos.quoteMint !== SOL) { log(`  CLOSE ${pos.name}: quoteMint mismatch on the SOL-capital path (capitalAsset=SOL but quoteMint=${pos.quoteMint}) — K8 trip, position record inconsistent`); halt.trip('K8', { quoteMint: String(pos.quoteMint), capitalAsset: 'SOL', pool: pos.pool || null, reason: 'liveCloseSol quoteMint !== SOL' }, 'STOP'); }
++  }
+   row.binShape = liveRowBins(pos); delete row.liveBins;   // closed rows keep the compact snapshot (PnL card bins), not the live chart model
+   if (pendingTokenEstimateSol > 0) { row.pendingTokenEstimateSol = pendingTokenEstimateSol; row.swapBackEstimated = true; const ps = state.pendingSells[state.pendingSells.length - 1]; if (ps && ps.row) ps.row.closedAt = row.closedAt; }
+   if (!opts.intermediate) { state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json')); }
+@@ -2499,6 +2572,7 @@
+   const q = await jupiterQuote(inputMint, outputMint, raw, inDec, outDec, slippageBps);
+   if (!q.ok) return { ok: false, error: q.error };
+   log(`  jupiter ${label}: ${q.inUi} -> ${q.outUi} (quote)`);
++  { const fee = halt.checkFeeBps(swapRoute.ROUTE_FEE_BPS, `swap:${label}`); if (!fee.ok) return { ok: false, error: fee.reason }; }   // Item 1 (K8): fee check at execution, before any swap is sent
+   if (CFG.DRY_RUN || CFG.PAPER || process.env.LIVE_CONFIRMED !== '1') {
+     return { ok: true, dry: true, inUi: q.inUi, outUi: q.outUi, quote: q };
+   }
+@@ -2565,7 +2639,7 @@
+   }
+   if (v && v.externalCapital) saveState(state, path.join(DIR, 'state.json'));
+   const ageH = (Date.now() - Date.parse(state.position.openedAt)) / 3.6e6;
+-  const live = { valueSol: +v.value.toFixed(5), pnlSol: +(v.value - state.position.depositSol).toFixed(5), pnlPct: +(v.pnl * 100).toFixed(2), feesSol: +v.fees.toFixed(5), ageH: +ageH.toFixed(2), price: v.price, inRange: v.inRange };
++  const live = { valueSol: +v.value.toFixed(5), pnlSol: +(v.value - state.position.depositSol).toFixed(5), quoteMint: state.position.quoteMint === USDC ? 'USDC' : 'SOL', pnlPct: +(v.pnl * 100).toFixed(2), feesSol: +v.fees.toFixed(5), ageH: +ageH.toFixed(2), price: v.price, inRange: v.inRange };   // Item 1 (N1): quote units of pnlSol — liveCycle converts USDC legs at the SOL price
+   state.position.liveBins = liveBinSnapshot(v) || state.position.liveBins; state.position.lastPrice = v.price; state.position.quoteSymbol = state.position.quoteSymbol || (state.position.quoteMint === USDC ? 'USDC' : 'SOL');
+   state.position.lastActiveBin = v.activeBinId;   // exitQuotePriority() reads it, like the dry run
+   state.position.lastValuation = { value: v.value, pnl: v.pnl, fees: v.fees, price: v.price, at: now() };   // H1: last known value, if the account disappears
+@@ -2625,6 +2699,7 @@
+           saveState(state, path.join(DIR, 'state.json'));
+         }
+         const trg = pos0.reshapePending ? { due: false } : liveReshapeExec.trigger({ pos: pos0, activeBinId: v.activeBinId, settings: pol, stop });   // never start a new reshape on top of an unfinished re-add
++        if (trg.capped && !pos0.reshapeFreezeLogged) { pos0.reshapeFreezeLogged = true; log(`  reshape FROZEN ${pos0.name}: ${pos0.reshapes} reshapes (RESHAPE_MAX=${trg.max}); position stays, -20% backstop live`); }   // Item 1: per-leg cap (closes OPEN-3)
+         if (trg.due) {
+           const ev = await liveReshapeExec.reshape(rctx);
+           pos0.botLiquidityTouched = true;
+@@ -2646,7 +2721,7 @@
+       } catch (e) { log('reshape error (position held, retry next poll): ' + e.message); }
+     }
+   }
+-  if (exitReason) await liveClose(state, exitReason);
++  if (exitReason) await liveClose(state, exitReason, { valuation: decisionVal ? { quoted: !!decisionVal.quoted, basis: decisionVal.valuationBasis || null } : null });   // Item 1: exit-valuation flag for the close row (§3.1.7)
+   else saveState(state, path.join(DIR, 'state.json'));   // persist peak / TP-emergency / SL+ state exactly like the dry run
+   return live;
+ }
+@@ -2822,6 +2897,31 @@
+     await writeLiveStatusPointer(state, { noNew: true });
+     return false;
+   }
++  // Item 1 (halt): once per cycle, before any open (scan or manual).
++  // Feed check first (a stale feed writes NO_NEW after 3 stale polls);
++  // then K2 drawdown and the K6 7-day branch, evaluated with open
++  // unrealised PnL included. A trip writes STOP and refuses opens from
++  // here on (latched).
++  // N1 fix: lives[].pnlSol is in QUOTE units per leg (SOL for SOL pools,
++  // USDC for USDC pools). halt.openUnrealisedSol() converts USDC legs at
++  // the SOL price (fresh solUsd(), else the last-good price the halt
++  // module remembers) — summing it raw would false-trip K2 on a -$1 USDC
++  // wobble and mask real drawdown on a USDC win. If no price exists at
++  // all, the K2/K6 verdict is skipped this poll (logged); the liveOpen
++  // gate (latch / STOP / NO_NEW / feed) still applies to every open.
++  {
++    const feed = halt.checkFeed(Date.now(), { scanAt: scan.last ? scan.last.at : null, pollSec: CFG.POLL_SEC });
++    if (!feed.ok) log('feed-stale: no new opens this poll');
++    const pxHalt = (await solUsd().catch(() => 0)) || halt.lastSolUsdPx() || 0;
++    const openUnrealised = halt.openUnrealisedSol(lives, pxHalt > 0 ? pxHalt : null);
++    if (openUnrealised == null) {
++      log('HALT K2/K6 skipped this cycle: no SOL/USD price to convert USDC open unrealised');
++    } else {
++      const equity = halt.params().bookSol + halt.status().netSol + openUnrealised;
++      const open = halt.checkOpen(Date.now(), { equitySol: equity, openUnrealisedSol: openUnrealised, scanAt: scan.last ? scan.last.at : null, pollSec: CFG.POLL_SEC });
++      if (!open.ok) { log('HALT refuses opens this cycle: ' + open.reason); await writeLiveStatusPointer(state, { lives, halt: halt.status() }); return false; }
++    }
++  }
+   if (await liveManualOpen(state, maxPos)) { saveState(state, path.join(DIR, 'state.json')); await writeLiveStatusPointer(state, { lives }); return false; }
+   if (state.positions.length >= maxPos) { await writeLiveStatusPointer(state, { lives }); return false; }   // slots full, like the dry run (the test session may lower the limit)
+   if (state.positions.some(p => exitQuotePriority(p) >= 4)) { log('a position is about to exit: not opening a new one this poll (same gate as the dry run)'); await writeLiveStatusPointer(state, { lives }); return false; }

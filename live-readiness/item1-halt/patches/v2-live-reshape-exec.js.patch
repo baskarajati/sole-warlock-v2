@@ -1,0 +1,16 @@
+--- a/live-reshape-exec.js
++++ b/live-reshape-exec.js
+@@ -7,6 +7,13 @@
+ const SOL_MINT = 'So11111111111111111111111111111111111111112';
+ function trigger({ pos, activeBinId, settings, stop }) {
+   if (stop || settings.RESHAPE_ENABLED === false) return { due: false };
++  // Item 1 (closes OPEN-3): per-leg reshape cap RESHAPE_MAX. The pristine
++  // live trigger has no cap — the 23 Nov port added the cap only to the
++  // paper freeze gate (bot.js paperCycle) and to paper-settings. Unset
++  // setting = D-0c default 5; an explicit positive integer wins. A frozen
++  // leg stays open; the -20% emergency stop, TP and max-age exits stay live.
++  const max = Number.isFinite(settings.RESHAPE_MAX) ? settings.RESHAPE_MAX : 5;
++  if ((pos.reshapes || 0) >= max) return { due: false, capped: true, max, reshapes: pos.reshapes || 0 };
+   const n = settings.RESHAPE_N ?? 5, anchor = pos.lastReshapeActiveBin ?? pos.entryActiveBin, down = anchor - activeBinId;
+   return { due: down >= n, down, n, anchor };
+ }

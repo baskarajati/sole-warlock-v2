@@ -1,0 +1,557 @@
+--- a/live-halt.js
++++ b/live-halt.js
+@@ -0,0 +1,554 @@
++'use strict';
++// Warlock live safety-halt enforcement — Item 1, System-Readiness Track.
++// D-0c parameter table (TRACK-RECORD-2026-11-24.md) + PILOT-SPEC-DRAFT.md
++// Rev 1 §3 (K1–K9) + LIVE-SAFETY-RAILS.md §5/§6.3.
++//
++// What this module is: pure accounting + trip / latch logic for the LIVE
++// instance. No chain IO, no key handling, no signing, no sending. The bot
++// (bot.js) calls it on the open path (liveOpen) and on every live close
++// (liveClose); this module decides, writes the HALT / STOP / NO_NEW files,
++// logs, and fires the Telegram alert through the bot's own notifyEmergency.
++//
++// What it is not: it does not close positions (liveClose does that through
++// the normal close path) and it does not stop the process (liveCycle exits
++// once flat when STOP is present — bot.js:2374 v1 / :2819 v2).
++//
++// PARAMETERS, NOT CONSTANTS (plan §0, D-0c): every threshold below is a
++// fraction of book capital / per-leg fraction. The effective table is read
++// from <instance-dir>/halt-params.json when present (sole confirms or
++// changes every number at go-live without a rebuild); DEFAULT_PARAMS is
++// only the D-0c Rev 1 fallback for a 5 SOL book / 1.25 SOL leg. Derived SOL
++// figures are computed from the fractions and exposed by status(), so QC
++// can verify the arithmetic (K1 -0.375, K2 0.75, K4 -0.50, K5 -1.50,
++// K6 -0.75, daily 0.375 SOL at Rev 1 scale).
++//
++// LATCH + MANUAL RESET ONLY (plan §3.1.3): once tripped (action STOP) the
++// halt latches in halt-state.json AND in the HALT file. A restart never
++// auto-clears it (cf. v2 caveat C11): checkOpen() refuses while tripped
++// even if the figures later improve. Clearing needs a deliberate operator
++// action: sole removes HALT + STOP after review (logged as a pilot event
++// by whoever removes them; this module never deletes HALT or STOP itself).
++// Two narrow, specified exceptions, both day/feed scoped and both logged:
++//   (a) a 1st daily-loss breach writes NO_NEW for the rest of that CET day
++//       only; at the next CET day boundary the module lifts that NO_NEW
++//       (it is a day-scoped pause, not a pilot kill — plan §3.1.2);
++//   (b) a feed-degraded NO_NEW is lifted by the module when a fresh price
++//       arrives (rails §6.3: "NO_NEW until a fresh price arrives").
++// A STOP trip is never lifted by this module under any condition.
++//
++// K9 (starvation) is NOT a code halt — monitoring rule only (plan §3.1.2).
++// This module deliberately has no K9 code path.
++//
++// K5 cluster definition (Consistency Programme Extension B): an entry
++// cluster is legs sharing one pool + one entry minute (method note,
++// consistency-baseline-2026-11-20.md: "event = instance + pool + entry
++// minute"). Worst-3 = the three most-negative cluster totals in the pilot
++// window, summed; trip when that sum < -30% of book.
++//
++// K8 "STOP absent while live" (D-0c table wording) is NOT implemented
++// literally: read literally it would trip on every legitimate live trade
++// (a live instance normally runs with STOP absent). See BUILD-NOTE.md
++// ambiguity A1. The implemented gate-state check trips when a live trade
++// is attempted outside the paper/live gate state: LIVE_CONFIRMED=1 while
++// PAPER=1 or DRY_RUN=1, or a live open/close attempted while STOP is
++// present. Flagged for QC/Security to confirm the reading.
++//
++// CET day: Europe/Berlin civil day (CET/CEST as observed in Berlin).
++// "Calendar day (CET)" in the plan is read as the Berlin civil day.
++const fs = require('fs');
++const path = require('path');
++
++const DEFAULT_PARAMS = Object.freeze({
++  // Book / leg (Rev 1: 5 SOL book, 1.25 SOL legs).
++  bookSol: 5,
++  legSol: 1.25,
++  // K1: single leg realised loss <= -30% of the leg.
++  k1LegLossPct: 0.30,
++  // K2: book drawdown from pilot-start equity > 15% of book.
++  k2DrawdownPct: 0.15,
++  // K3: consecutive emergency stops.
++  k3ConsecEmergency: 3,
++  // K4: 5 consecutive losses totalling < -10% of book.
++  k4ConsecLosses: 5,
++  k4LossSumPct: 0.10,
++  // K5: worst-3 entry clusters combined in the window < -30% of book.
++  k5Worst3Pct: 0.30,
++  // K6: net < -15% of book after 30 closed legs or at the 7-day close.
++  k6NetPct: 0.15,
++  k6MinLegs: 30,
++  k6WindowDays: 7,
++  // Daily-loss breaker: 7.5% of book per calendar day (CET). K7: 2 breaches.
++  dailyLossPct: 0.075,
++  k7MaxBreaches: 2,
++  // K8: quote-vs-fill gap > 0.0625 SOL/leg on 2 consecutive exits.
++  k8GapSol: 0.0625,
++  k8GapConsec: 2,
++  // K8: max swap fee in bps. Default is supplied per bot by the caller
++  // (v1: 0 bps — patched out; v2: 50 bps). halt-params.json may override.
++  maxFeeBps: null,
++  // Feed rules (§3.1.7): stale after 2 polls, degraded after 3 stale polls.
++  feedStalePolls: 2,
++  feedDegradedPolls: 3,
++  pollSec: 300,
++  // RESHAPE_MAX per-leg cap (closes OPEN-3). Settings may override; the
++  // live reshape trigger reads settings.RESHAPE_MAX first.
++  reshapeMax: 5,
++});
++
++function cetDayString(ts) {
++  // Europe/Berlin civil date, YYYY-MM-DD.
++  return new Intl.DateTimeFormat('en-CA', {
++    timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit',
++  }).format(new Date(ts));
++}
++
++function freshState() {
++  return {
++    version: 1,
++    pilotStartAt: null,          // ISO, first liveCycle evaluation
++    dayKey: null,                // current CET day key
++    dayNetSol: 0,                // net realised SOL on dayKey
++    dayBreaches: 0,              // daily-loss breaches in this pilot window
++    dayBreachDates: [],          // CET dates already counted (one breach/day)
++    consecEmergency: 0,
++    lossRun: [],                 // pnlSol of the current consecutive-loss run
++    clusters: {},                // "<pool>|<entry-minute-ISO>" -> sum pnlSol
++    closedLegs: 0,
++    netSol: 0,                   // cumulative realised SOL, pilot window
++    consecGap: 0,                // consecutive exits with gap > k8GapSol
++    lastGapSol: null,
++    feedStalePolls: 0,
++    feedNoNew: false,            // NO_NEW written by the feed rule, not by hand
++    lastSolUsdAt: null,          // ms epoch of last good SOL/USD price
++    lastSolUsdPx: null,          // last good SOL/USD price (USD per SOL); persisted so a restart mid-outage still has a conversion price (N2)
++    lastScanAt: null,            // ms epoch of last screening snapshot
++    tripped: null,               // {criterion, action:'STOP', at, figures} | null
++    dailyNoNew: null,            // {date, breaches} | null (1st daily breach)
++  };
++}
++
++function create(opts = {}) {
++  const dir = opts.dir || process.cwd();
++  const log = opts.log || (() => {});
++  const notifyEmergency = opts.notifyEmergency || null; // (rec) => Promise
++  const bot = opts.bot || 'v1';
++  const haltFile = path.join(dir, 'HALT');
++  const stopFile = path.join(dir, 'STOP');
++  const noNewFile = path.join(dir, 'NO_NEW');
++  const stateFile = path.join(dir, 'halt-state.json');
++  const paramsFile = opts.paramsFile || path.join(dir, 'halt-params.json');
++
++  // ---- parameters -------------------------------------------------------
++  let fileParams = {};
++  try { fileParams = JSON.parse(fs.readFileSync(paramsFile, 'utf8')); }
++  catch (e) { if (e.code !== 'ENOENT') log(`halt params: cannot read ${paramsFile}: ${e.message}; using D-0c defaults`); }
++  const envParams = {};
++  for (const k of Object.keys(DEFAULT_PARAMS)) {
++    const ev = process.env['HALT_' + k.toUpperCase()];
++    if (ev !== undefined && ev !== '') { const n = Number(ev); envParams[k] = Number.isFinite(n) ? n : ev; }
++  }
++  const params = {
++    ...DEFAULT_PARAMS,
++    ...(opts.maxFeeBps != null ? { maxFeeBps: opts.maxFeeBps } : {}),
++    ...fileParams,
++    ...envParams,
++  };
++  if (params.maxFeeBps == null) params.maxFeeBps = bot === 'v2' ? 50 : 0;
++  const derived = {
++    k1Sol: params.k1LegLossPct * params.legSol,
++    k2Sol: params.k2DrawdownPct * params.bookSol,
++    k4Sol: params.k4LossSumPct * params.bookSol,
++    k5Sol: params.k5Worst3Pct * params.bookSol,
++    k6Sol: params.k6NetPct * params.bookSol,
++    dailySol: params.dailyLossPct * params.bookSol,
++  };
++
++  // ---- persisted state --------------------------------------------------
++  // N6 fix: an unparseable state file (or a parsed file with an
++  // unsupported version) used to restart accounting from zero with only a
++  // log line — the K2/K6/K7 history was lost without anyone being told.
++  // Now it alerts via notifyEmergency (alert-only: nothing is refused,
++  // so a transient disk issue cannot halt the pilot by itself). A missing
++  // file (ENOENT) is normal on first run and does not alert.
++  let state = freshState();
++  try {
++    const s = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
++    if (s && s.version === 1) state = { ...freshState(), ...s };
++    else {
++      log(`halt state: ${stateFile} parsed but version is ${s && s.version} (expected 1); starting fresh (halt latch NOT assumed)`);
++      alert('halt-state-corrupt', `${stateFile}: unsupported state version ${s && s.version} (expected 1) — accounting restarted from zero; no halt action taken`, 'INFO');
++    }
++  } catch (e) {
++    if (e.code !== 'ENOENT') {
++      log(`halt state: cannot read ${stateFile}: ${e.message}; starting fresh (halt latch NOT assumed)`);
++      alert('halt-state-corrupt', `${stateFile}: unparseable (${e.message}) — accounting restarted from zero; no halt action taken`, 'INFO');
++    }
++  }
++  // The HALT file is the durable latch: if it exists but state was lost,
++  // re-latch from it (a restart must never auto-clear a halt — C11).
++  if (!state.tripped && fs.existsSync(haltFile)) {
++    try {
++      const h = JSON.parse(fs.readFileSync(haltFile, 'utf8'));
++      state.tripped = { criterion: h.criterion || 'unknown', action: 'STOP', at: h.at || null, figures: h.figures || {}, recoveredFromHaltFile: true };
++      log(`halt: HALT file present without state — re-latched trip ${state.tripped.criterion}`);
++    } catch { state.tripped = { criterion: 'unknown', action: 'STOP', at: null, figures: {}, recoveredFromHaltFile: true }; }
++  }
++  function saveState() {
++    try {
++      const tmp = stateFile + '.' + process.pid + '.tmp';
++      fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
++      fs.renameSync(tmp, stateFile);
++    } catch (e) { log(`halt state: cannot write ${stateFile}: ${e.message}`); }
++  }
++  function writeFile(file, obj) {
++    try { fs.writeFileSync(file, typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2)); return true; }
++    catch (e) { log(`halt: cannot write ${file}: ${e.message}`); return false; }
++  }
++
++  // ---- alert ------------------------------------------------------------
++  function alert(criterion, figures, action) {
++    // notifyEmergency's title is the existing emergency-stop title; the
++    // halt criterion + figures ride in the Alasan line (closeReasonText),
++    // which closeBody renders verbatim. Item 4a may give halts their own
++    // title later; the content that matters is already in the alert.
++    // Action 'INFO' (N6) is alert-only, never a halt: the text must not
++    // claim opens are refused. Every other action keeps its wording.
++    const text =
++      `HALT ${criterion}: ${figures} — action ${action}. ` +
++      (action === 'INFO'
++        ? 'Alert only: no halt action taken, opens are NOT refused. Accounting history may have restarted from zero — check halt-state.json before trusting K2/K6/K7 figures.'
++        : action === 'STOP'
++          ? 'Pilot killed: new opens refused (latched). Open positions unwind through the normal close path; process exits once flat. Manual reset only (sole removes HALT + STOP after review).'
++          : 'New opens refused. Open positions run to their normal exits.');
++    log(`HALT ALERT ${criterion}: ${text}`);
++    if (!notifyEmergency) return;
++    try {
++      const r = notifyEmergency({
++        name: `HALT ${criterion}`, pool: null, capitalAsset: 'SOL',
++        pnlCapital: null, pnlUsd: null, closeReasonText: text,
++        haltCriterion: criterion, haltAction: action,
++      });
++      if (r && typeof r.catch === 'function') r.catch(() => {});
++    } catch { /* alert failure must never break the halt itself */ }
++  }
++
++  // ---- trip -------------------------------------------------------------
++  // action 'STOP' latches (first trip wins, never overwritten, never
++  // auto-cleared). Action 'NO_NEW' is a day/feed scoped pause, not a latch.
++  function trip(criterion, figures, action) {
++    if (action === 'STOP' && state.tripped) {
++      log(`halt: already tripped (${state.tripped.criterion}); ${criterion} also met, not overwriting the latch`);
++      return state.tripped;
++    }
++    const rec = { criterion, action, at: new Date().toISOString(), figures };
++    if (action === 'STOP') {
++      state.tripped = rec;
++      writeFile(haltFile, { ...rec, bot, bookSol: params.bookSol });
++      writeFile(stopFile, `HALT ${criterion} at ${rec.at}\n${JSON.stringify(rec.figures)}\n`);
++      saveState();
++      log(`HALT TRIP ${criterion} action=STOP figures=${JSON.stringify(rec.figures)} — STOP written, new opens refused (latched)`);
++      alert(criterion, JSON.stringify(rec.figures), 'STOP');
++    } else {
++      writeFile(noNewFile, `HALT ${criterion} at ${rec.at}\n${JSON.stringify(rec.figures)}\n`);
++      saveState();
++      log(`HALT TRIP ${criterion} action=NO_NEW figures=${JSON.stringify(rec.figures)} — NO_NEW written`);
++      alert(criterion, JSON.stringify(rec.figures), 'NO_NEW');
++    }
++    return rec;
++  }
++
++  // ---- day rollover (CET) ----------------------------------------------
++  function rollDay(nowMs) {
++    const today = cetDayString(nowMs);
++    if (!state.dayKey) { state.dayKey = today; state.dayNetSol = 0; saveState(); return; }
++    if (state.dayKey === today) return;
++    const prev = state.dayKey;
++    state.dayKey = today;
++    state.dayNetSol = 0;
++    // (a) A 1st daily-breach NO_NEW lives for the rest of its day only.
++    if (state.dailyNoNew && state.dailyNoNew.date !== today) {
++      state.dailyNoNew = null;
++      if (fs.existsSync(noNewFile) && !state.feedNoNew && !state.tripped) {
++        try { fs.unlinkSync(noNewFile); log(`halt: CET day rolled ${prev} -> ${today}: daily NO_NEW lifted (1st-breach pause is day-scoped)`); } catch (e) { log(`halt: cannot lift daily NO_NEW: ${e.message}`); }
++      } else if (fs.existsSync(noNewFile)) {
++        log(`halt: CET day rolled ${prev} -> ${today}: daily pause expired but NO_NEW left in place (feed NO_NEW or latched halt active)`);
++      }
++    }
++    saveState();
++  }
++
++  // ---- feed -------------------------------------------------------------
++  // noteSolUsdAt optionally takes the price that was just fetched. The
++  // last-good price is kept in state (persisted) so the N1 conversion
++  // and the N2 close fallback still have a price after a restart in the
++  // middle of a feed outage, when solUsd()'s in-process cache is empty.
++  function noteSolUsdAt(tsMs, pxUsd = null) {
++    state.lastSolUsdAt = tsMs;
++    if (Number.isFinite(pxUsd) && pxUsd > 0) { state.lastSolUsdPx = pxUsd; saveState(); }
++  }
++  // Last-good SOL/USD price (USD per SOL), or null if none was ever seen.
++  function lastSolUsdPx() { return (Number.isFinite(state.lastSolUsdPx) && state.lastSolUsdPx > 0) ? state.lastSolUsdPx : null; }
++  function noteScanAt(tsMs) { if (tsMs) state.lastScanAt = tsMs; }
++  function feedStatus(nowMs, { scanAt = null, pollSec = params.pollSec } = {}) {
++    if (scanAt) state.lastScanAt = scanAt;
++    const staleMs = params.feedStalePolls * pollSec * 1000;
++    const solUsdAgeMs = state.lastSolUsdAt == null ? Infinity : nowMs - state.lastSolUsdAt;
++    const scanAgeMs = state.lastScanAt == null ? Infinity : nowMs - state.lastScanAt;
++    const stale = solUsdAgeMs > staleMs || scanAgeMs > staleMs;
++    return { stale, solUsdAgeMs, scanAgeMs, staleAfterMs: staleMs, stalePolls: state.feedStalePolls };
++  }
++  // Called once per liveCycle poll. Returns {ok:true} or {ok:false,...}.
++  // Stale 3 consecutive polls -> feed-degraded alert + NO_NEW until a
++  // fresh price arrives (rails §6.3 rule 5). Fresh again -> lift the
++  // feed NO_NEW (logged) and reset the counter.
++  function checkFeed(nowMs, { scanAt = null, pollSec = params.pollSec } = {}) {
++    const st = feedStatus(nowMs, { scanAt, pollSec });
++    if (!st.stale) {
++      if (state.feedStalePolls) log(`halt: feed fresh again (SOL/USD age ${st.solUsdAgeMs}ms, scan age ${st.scanAgeMs}ms); stale-poll counter reset`);
++      state.feedStalePolls = 0;
++      if (state.feedNoNew && !state.tripped && !state.dailyNoNew) {
++        state.feedNoNew = false;
++        try { fs.unlinkSync(noNewFile); log('halt: feed fresh — feed-degraded NO_NEW lifted'); } catch (e) { log(`halt: cannot lift feed NO_NEW: ${e.message}`); }
++      } else if (state.feedNoNew) { state.feedNoNew = false; log('halt: feed fresh — feed NO_NEW flag cleared, NO_NEW file left (daily pause or latched halt also active)'); }
++      saveState();
++      return { ok: true, ...st };
++    }
++    state.feedStalePolls += 1;
++    saveState();
++    log(`halt: feed STALE poll ${state.feedStalePolls}/${params.feedDegradedPolls} (SOL/USD age ${st.solUsdAgeMs === Infinity ? 'never' : Math.round(st.solUsdAgeMs / 1000) + 's'}, scan age ${st.scanAgeMs === Infinity ? 'never' : Math.round(st.scanAgeMs / 1000) + 's'}): no new opens`);
++    if (state.feedStalePolls >= params.feedDegradedPolls && !state.feedNoNew && !state.tripped) {
++      state.feedNoNew = true;
++      writeFile(noNewFile, `feed-degraded at ${new Date(nowMs).toISOString()}\n`);
++      saveState();
++      log('halt: feed stale 3 consecutive polls — feed-degraded alert + NO_NEW until a fresh price arrives');
++      alert('feed-degraded', `SOL/USD age ${st.solUsdAgeMs === Infinity ? 'never' : Math.round(st.solUsdAgeMs / 1000) + 's'}, scan age ${st.scanAgeMs === Infinity ? 'never' : Math.round(st.scanAgeMs / 1000) + 's'}, ${state.feedStalePolls} stale polls`, 'NO_NEW');
++    }
++    return { ok: false, reason: 'feed-stale', ...st };
++  }
++
++  // ---- open-path gate ---------------------------------------------------
++  // refuseOpen(): the light gate liveOpen() calls before any chain call.
++  // Checks latch, STOP/NO_NEW files, the day-scoped daily pause, and feed
++  // freshness. It does NOT evaluate K2/K6 — those need open unrealised PnL
++  // and are evaluated once per cycle by liveCycle via checkOpen() below.
++  function refuseOpen(nowMs, { scanAt = null, pollSec = params.pollSec, stopPresent = false, noNewPresent = false } = {}) {
++    rollDay(nowMs);
++    if (state.tripped) return { ok: false, reason: `halt latched: ${state.tripped.criterion}`, criterion: state.tripped.criterion, action: 'STOP' };
++    if (stopPresent || fs.existsSync(stopFile)) return { ok: false, reason: 'STOP file present' };
++    if (noNewPresent || fs.existsSync(noNewFile)) return { ok: false, reason: 'NO_NEW file present' };
++    if (state.dailyNoNew && state.dailyNoNew.date === cetDayString(nowMs)) return { ok: false, reason: `daily-loss pause (breach ${state.dailyNoNew.breaches} of ${params.k7MaxBreaches})`, criterion: 'K7-daily', action: 'NO_NEW' };
++    const feed = feedStatus(nowMs, { scanAt, pollSec });
++    if (feed.stale) return { ok: false, reason: `feed-stale: no new opens (SOL/USD age ${feed.solUsdAgeMs === Infinity ? 'never' : Math.round(feed.solUsdAgeMs / 1000) + 's'}, scan age ${feed.scanAgeMs === Infinity ? 'never' : Math.round(feed.scanAgeMs / 1000) + 's'})`, criterion: 'feed-stale', action: 'NO_NEW' };
++    return { ok: true };
++  }
++  // The single choke point: liveOpen() calls this before any chain call.
++  // Every open route (scan cycle, manual open, reposition openNew) funnels
++  // through liveOpen, so no route bypasses this check.
++  function checkOpen(nowMs, {
++    equitySol = null, openUnrealisedSol = 0, scanAt = null,
++    pollSec = params.pollSec, stopPresent = false, noNewPresent = false,
++  } = {}) {
++    rollDay(nowMs);
++    if (!state.pilotStartAt) { state.pilotStartAt = new Date(nowMs).toISOString(); saveState(); }
++    if (state.tripped) return { ok: false, reason: `halt latched: ${state.tripped.criterion}`, criterion: state.tripped.criterion, action: 'STOP' };
++    if (stopPresent || fs.existsSync(stopFile)) return { ok: false, reason: 'STOP file present' };
++    if (noNewPresent || fs.existsSync(noNewFile)) return { ok: false, reason: 'NO_NEW file present' };
++    if (state.dailyNoNew && state.dailyNoNew.date === cetDayString(nowMs)) return { ok: false, reason: `daily-loss pause (breach ${state.dailyNoNew.breaches} of ${params.k7MaxBreaches})`, criterion: 'K7-daily', action: 'NO_NEW' };
++    const feed = feedStatus(nowMs, { scanAt, pollSec });
++    if (feed.stale) return { ok: false, reason: `feed-stale: no new opens (SOL/USD age ${feed.solUsdAgeMs === Infinity ? 'never' : Math.round(feed.solUsdAgeMs / 1000) + 's'}, scan age ${feed.scanAgeMs === Infinity ? 'never' : Math.round(feed.scanAgeMs / 1000) + 's'})`, criterion: 'feed-stale', action: 'NO_NEW' };
++    // K2: drawdown from pilot-start equity. Pilot-start equity is the book
++    // (bookSol); current equity = book + realised net + open unrealised.
++    if (equitySol != null) {
++      const drawdown = params.bookSol - equitySol;
++      if (drawdown > derived.k2Sol) {
++        trip('K2', { drawdownSol: +drawdown.toFixed(6), limitSol: derived.k2Sol, equitySol: +equitySol.toFixed(6), bookSol: params.bookSol }, 'STOP');
++        return { ok: false, reason: `K2 drawdown ${drawdown.toFixed(4)} SOL > ${derived.k2Sol} SOL`, criterion: 'K2', action: 'STOP' };
++      }
++    } else if (state.netSol + openUnrealisedSol < -derived.k2Sol) {
++      trip('K2', { drawdownSol: +(-(state.netSol + openUnrealisedSol)).toFixed(6), limitSol: derived.k2Sol, netSol: +state.netSol.toFixed(6), openUnrealisedSol: +openUnrealisedSol.toFixed(6) }, 'STOP');
++      return { ok: false, reason: 'K2 drawdown (realised + open unrealised)', criterion: 'K2', action: 'STOP' };
++    }
++    // K6, time branch: at the 7-day close with net < -15% of book.
++    if (state.pilotStartAt && nowMs - Date.parse(state.pilotStartAt) >= params.k6WindowDays * 86400e3 && state.netSol < -derived.k6Sol) {
++      trip('K6', { netSol: +state.netSol.toFixed(6), limitSol: -derived.k6Sol, closedLegs: state.closedLegs, windowDays: params.k6WindowDays }, 'STOP');
++      return { ok: false, reason: `K6 net ${state.netSol.toFixed(4)} SOL < ${-derived.k6Sol} SOL at 7-day close`, criterion: 'K6', action: 'STOP' };
++    }
++    return { ok: true };
++  }
++
++  // ---- open unrealised PnL in SOL (N1) ----------------------------------
++  // livePositionCycle builds one lives[] entry per open leg:
++  //   { pnlSol, quoteMint } where pnlSol is in QUOTE units — SOL for
++  //   SOL-quoted pools, USDC for USDC-quoted pools (liveOpenUsdcPool
++  //   books depositSol in USDC, and liveValuation().value is in quote
++  //   units). Summing pnlSol raw treats USDC as SOL: a -$1 wobble reads
++  //   as -1 SOL and false-trips K2; a +$5 win masks real drawdown.
++  // This is the function liveCycle calls for its equity computation, so
++  // the wiring-level regression test (test-n1-wiring.js) exercises this
++  // exact code with lives[] shaped exactly as livePositionCycle builds
++  // them. USDC legs are divided by the SOL price; SOL legs pass through.
++  // quoteMint is the 'SOL'/'USDC' symbol livePositionCycle stamps from
++  // the position's mint. Returns null when a leg cannot be converted —
++  // a USDC leg with no usable price, or an entry with no quoteMint — so
++  // the caller skips the K2/K6 equity verdict for that poll and logs,
++  // instead of guessing.
++  function openUnrealisedSol(lives, solUsdPx) {
++    let sum = 0;
++    for (const l of lives || []) {
++      const pnl = Number(l && l.pnlSol) || 0;
++      if (l && l.quoteMint === 'USDC') {
++        if (!(solUsdPx > 0)) { log('halt: openUnrealisedSol: USDC leg open with no SOL/USD price — K2/K6 equity verdict skipped this poll'); return null; }
++        sum += pnl / solUsdPx;
++      } else if (l && l.quoteMint === 'SOL') {
++        sum += pnl;
++      } else {
++        log('halt: openUnrealisedSol: live entry without quoteMint — K2/K6 equity verdict skipped this poll');
++        return null;
++      }
++    }
++    return sum;
++  }
++
++  // ---- fee / gate checks (K8) -------------------------------------------
++  // N4 fix (fail-closed): a safety gate that cannot read its input must
++  // not pass trades. null / undefined / NaN / non-numeric bps now TRIP
++  // K8 (refuse + alert) instead of returning ok:true — a missing or
++  // renamed ROUTE_FEE_BPS export used to silently disable the fee gate.
++  function checkFeeBps(bps, where = 'swap') {
++    if (bps == null || !Number.isFinite(+bps)) {
++      trip('K8', { feeBps: bps == null ? null : String(bps), maxFeeBps: params.maxFeeBps, where, reason: 'fee unreadable (fail-closed)' }, 'STOP');
++      return { ok: false, reason: `K8 fee unreadable (${where}): cannot verify the swap fee is within ${params.maxFeeBps} bps — refusing (fail-closed)`, criterion: 'K8', action: 'STOP' };
++    }
++    if (+bps > params.maxFeeBps) {
++      trip('K8', { feeBps: +bps, maxFeeBps: params.maxFeeBps, where }, 'STOP');
++      return { ok: false, reason: `K8 fee ${bps} bps > ${params.maxFeeBps} bps (${where})`, criterion: 'K8', action: 'STOP' };
++    }
++    return { ok: true };
++  }
++  function checkGate({ paper, dryRun, liveConfirmed }) {
++    // A live trade attempted outside the paper/live gate state.
++    if (liveConfirmed && (paper || dryRun)) {
++      trip('K8', { gate: 'LIVE_CONFIRMED=1 while PAPER=1 or DRY_RUN=1', paper, dryRun, liveConfirmed }, 'STOP');
++      return { ok: false, reason: 'K8 gate state: LIVE_CONFIRMED=1 while PAPER/DRY_RUN=1', criterion: 'K8', action: 'STOP' };
++    }
++    return { ok: true };
++  }
++
++  // ---- per-close accounting (K1, K3–K8) ---------------------------------
++  // ev: {pnlSol, legSol, reason, pool, openedAt, quotedSol, realisedSol,
++  //      feeBps}. Intermediate reposition legs must NOT be passed here
++  // (they are not closed legs; the final close carries the leg PnL).
++  function recordClose(ev = {}, nowMs = Date.now()) {
++    rollDay(nowMs);
++    const pnlSol = Number(ev.pnlSol) || 0;
++    const legSol = Number(ev.legSol) || params.legSol;
++    const reason = ev.reason || '';
++    state.closedLegs += 1;
++    state.netSol += pnlSol;
++    state.dayNetSol += pnlSol;
++    const trips = [];
++    // K1: single leg realised loss <= -30% of the leg.
++    if (pnlSol <= -params.k1LegLossPct * legSol) {
++      trips.push(trip('K1', { pnlSol: +pnlSol.toFixed(6), legSol: +legSol.toFixed(6), limitSol: +(params.k1LegLossPct * legSol).toFixed(6), pool: ev.pool || null, reason }, 'STOP'));
++    }
++    // K3: consecutive emergency stops.
++    if (reason === 'emergency_stop') {
++      state.consecEmergency += 1;
++      if (state.consecEmergency >= params.k3ConsecEmergency) {
++        trips.push(trip('K3', { consecEmergency: state.consecEmergency, pool: ev.pool || null }, 'STOP'));
++      }
++    } else state.consecEmergency = 0;
++    // K4: consecutive losses; trip on the trailing-5 sum < -10% of book.
++    if (pnlSol < 0) {
++      state.lossRun.push(pnlSol);
++      const last5 = state.lossRun.slice(-params.k4ConsecLosses);
++      if (state.lossRun.length >= params.k4ConsecLosses) {
++        const sum5 = last5.reduce((a, b) => a + b, 0);
++        if (sum5 < -derived.k4Sol) {
++          trips.push(trip('K4', { consecLosses: state.lossRun.length, last5SumSol: +sum5.toFixed(6), limitSol: -derived.k4Sol }, 'STOP'));
++        }
++      }
++    } else state.lossRun = [];
++    // K5: worst-3 entry clusters combined < -30% of book.
++    if (ev.pool && ev.openedAt) {
++      const minute = String(ev.openedAt).slice(0, 16); // pool + entry minute
++      const key = `${ev.pool}|${minute}`;
++      state.clusters[key] = (state.clusters[key] || 0) + pnlSol;
++      const worst3 = Object.values(state.clusters).sort((a, b) => a - b).slice(0, 3);
++      const worst3Sum = worst3.reduce((a, b) => a + b, 0);
++      if (worst3.length === 3 && worst3Sum < -derived.k5Sol) {
++        trips.push(trip('K5', { worst3SumSol: +worst3Sum.toFixed(6), limitSol: -derived.k5Sol, worst3: worst3.map((x) => +x.toFixed(6)) }, 'STOP'));
++      }
++    }
++    // K6, legs branch: net < -15% of book after 30 closed legs.
++    if (state.closedLegs >= params.k6MinLegs && state.netSol < -derived.k6Sol) {
++      trips.push(trip('K6', { netSol: +state.netSol.toFixed(6), limitSol: -derived.k6Sol, closedLegs: state.closedLegs }, 'STOP'));
++    }
++    // K7 / daily-loss breaker: net realised loss for the CET day.
++    if (state.dayNetSol <= -derived.dailySol && !state.dayBreachDates.includes(state.dayKey)) {
++      state.dayBreachDates.push(state.dayKey);
++      state.dayBreaches += 1;
++      if (state.dayBreaches >= params.k7MaxBreaches) {
++        trips.push(trip('K7', { dayNetSol: +state.dayNetSol.toFixed(6), limitSol: -derived.dailySol, breaches: state.dayBreaches, date: state.dayKey }, 'STOP'));
++      } else {
++        state.dailyNoNew = { date: state.dayKey, breaches: state.dayBreaches };
++        writeFile(noNewFile, `daily-loss breach 1 at ${new Date(nowMs).toISOString()}; day net ${state.dayNetSol.toFixed(6)} SOL\n`);
++        saveState();
++        log(`HALT TRIP K7-daily action=NO_NEW figures=${JSON.stringify({ dayNetSol: +state.dayNetSol.toFixed(6), limitSol: -derived.dailySol, breaches: state.dayBreaches })} — NO_NEW written, no new opens rest of ${state.dayKey}`);
++        alert('K7-daily', JSON.stringify({ dayNetSol: +state.dayNetSol.toFixed(6), limitSol: -derived.dailySol, breaches: state.dayBreaches, date: state.dayKey }), 'NO_NEW');
++        trips.push({ criterion: 'K7-daily', action: 'NO_NEW' });
++      }
++    }
++    // K8: quote-vs-fill gap > 0.0625 SOL/leg on 2 consecutive exits.
++    if (ev.quotedSol != null && ev.realisedSol != null) {
++      const gap = Math.abs(Number(ev.quotedSol) - Number(ev.realisedSol));
++      state.lastGapSol = +gap.toFixed(6);
++      if (gap > params.k8GapSol) {
++        state.consecGap += 1;
++        if (state.consecGap >= params.k8GapConsec) {
++          trips.push(trip('K8', { gapSol: +gap.toFixed(6), limitSol: params.k8GapSol, consecGap: state.consecGap, pool: ev.pool || null }, 'STOP'));
++        }
++      } else state.consecGap = 0;
++    }
++    // K8: fee at execution. Fail-closed (N4), consistent with
++    // checkFeeBps: a fee value that IS supplied but unreadable trips.
++    // An ABSENT fee (null/undefined = no fee observation, e.g. callers
++    // that do not pass one) is skipped, not tripped — the open/swap-time
++    // checkFeeBps is the gate that sees ROUTE_FEE_BPS on every open and
++    // swap, and it now trips on an unreadable value there.
++    if (ev.feeBps != null && !Number.isFinite(+ev.feeBps)) {
++      trips.push(trip('K8', { feeBps: String(ev.feeBps), maxFeeBps: params.maxFeeBps, where: 'close', reason: 'fee unreadable (fail-closed)' }, 'STOP'));
++    } else if (ev.feeBps != null && +ev.feeBps > params.maxFeeBps) {
++      trips.push(trip('K8', { feeBps: +ev.feeBps, maxFeeBps: params.maxFeeBps, where: 'close' }, 'STOP'));
++    }
++    saveState();
++    return { trips, tripped: state.tripped, state: status() };
++  }
++
++  // ---- status (Monitor live section) ------------------------------------
++  function status() {
++    return {
++      bot, tripped: state.tripped, dailyNoNew: state.dailyNoNew, feedNoNew: state.feedNoNew,
++      pilotStartAt: state.pilotStartAt, dayKey: state.dayKey, dayNetSol: +state.dayNetSol.toFixed(6),
++      dayBreaches: state.dayBreaches, consecEmergency: state.consecEmergency,
++      consecLosses: state.lossRun.length, consecLossSumSol: +state.lossRun.reduce((a, b) => a + b, 0).toFixed(6),
++      closedLegs: state.closedLegs, netSol: +state.netSol.toFixed(6),
++      consecGap: state.consecGap, lastGapSol: state.lastGapSol,
++      feedStalePolls: state.feedStalePolls,
++      lastSolUsdAt: state.lastSolUsdAt, lastSolUsdPx: state.lastSolUsdPx, lastScanAt: state.lastScanAt,
++      params: { ...params },
++      derived: { ...derived },
++    };
++  }
++
++  return {
++    params: () => ({ ...params, derived: { ...derived } }),
++    status, state: () => JSON.parse(JSON.stringify(state)),
++    noteSolUsdAt, noteScanAt, lastSolUsdPx, openUnrealisedSol, feedStatus, checkFeed, checkOpen, refuseOpen,
++    checkFeeBps, checkGate, recordClose, trip,
++    isHalted: () => !!state.tripped,
++    files: { haltFile, stopFile, noNewFile, stateFile, paramsFile },
++  };
++}
++
++module.exports = { create, DEFAULT_PARAMS, cetDayString };
