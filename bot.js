@@ -1815,6 +1815,13 @@ async function paperCycle(state) {
       const policy={...CFG,...(pos.strategySettings||{})},pv={...v,n:policy.RESHAPE_N,reshape:policy.RESHAPE_ENABLED??true,compound:policy.COMPOUND_ENABLED??true}; // emergency derives from val.pnlPct (net USDC), never token-price drop
       let exitReason=paperExit.decide({pos,val,activeBin:snap.active.binId,settings:policy,pollId,stopReason:stop?reasonStop:null});
       if(!exitReason&&pv.reshape&&!stop){
+        // E-config port (2026-11-23, from Warlock v1 Batch 1 arm E): once pos.reshapes reaches policy.RESHAPE_MAX (5), no
+        // further reshape — the position stays open and keeps earning fees. The -20%
+        // emergency stop above (decide()) stays live, so a frozen position can still
+        // be stopped out. Logged once per position, not every poll.
+        const frozen=Number.isFinite(policy.RESHAPE_MAX)&&(pos.reshapes||0)>=policy.RESHAPE_MAX;
+        if(frozen){if(!pos.reshapeFreezeLogged){pos.reshapeFreezeLogged=true;log(`  [${v.id}] reshape FROZEN ${pos.name}: ${pos.reshapes} reshapes (RESHAPE_MAX=${policy.RESHAPE_MAX}); position stays, -20% backstop live`);}}
+        else{
         const anchor=pos.lastReshapeActiveBin??pos.entryActiveBin,down=anchor-snap.active.binId;
         if(down>=pv.n){
           try{
@@ -1826,6 +1833,7 @@ async function paperCycle(state) {
               exitReason=paperExit.decide({pos,val,activeBin:snap.active.binId,settings:policy,pollId});
             }
           }catch(e){log(`[${v.id}] reshape: `+e.message);}
+        }
         }
       }
       const ageH=(Date.now()-Date.parse(pos.openedAt))/3.6e6;

@@ -25,6 +25,7 @@ const DEFAULTS = Object.freeze({
   MIN_LIQ_USD: 10000,
   MIN_AGE_H: 0.5,
   RESHAPE_N: 5,
+  RESHAPE_MAX: null,  // null = unlimited (author behaviour); a positive integer freezes reshaping per position at that count (Warlock v1 Book E = 5)
   MIN_BIN_STEP: 80,
   MAX_BIN_STEP: 400,
   UPPER_BUFFER_BINS: 0,
@@ -120,6 +121,7 @@ const FIELDS = Object.freeze({
   MIN_LIQ_USD: { type: 'integer', min: 0, max: 10_000_000, integer: true, default: DEFAULTS.MIN_LIQ_USD, label: 'TVL minimum', unit: 'USD', displayScale: 1 },
   MIN_AGE_H: { type: 'number', min: 0, max: 720, integer: false, default: DEFAULTS.MIN_AGE_H, label: 'Umur pool minimum', unit: 'jam', displayScale: 1 },
   RESHAPE_N: { type: 'integer', min: 1, max: 50, integer: true, default: DEFAULTS.RESHAPE_N, label: 'Reshape setiap N bin', unit: 'bin', displayScale: 1 },
+  RESHAPE_MAX: {type:'integer', min:1, max:10000, integer:true, default:5, label:'Maks reshape per posisi (freeze: posisi tetap open, exit lain tetap jalan)', unit:'kali', displayScale:1},
   TP: { type: 'number', min: 0.01, max: 2, integer: false, default: DEFAULTS.TP, label: 'Take profit', unit: '%', displayScale: 100 },
   TP_USD_PCT: { type: 'number', min: 0.1, max: 200, integer: false, default: DEFAULTS.TP_USD_PCT, label: 'Take profit aset modal posisi (USDC / SOL)', unit: '%', displayScale: 1 },
   OOR_RIGHT_CLOSE: { type: 'boolean', default: true, label: 'Tutup OOR kanan → aset modal posisi', unit: '', displayScale: 1 },
