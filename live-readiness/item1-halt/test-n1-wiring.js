@@ -49,7 +49,7 @@ function makeHalt(dir, bot = 'v1') {
   const h = haltMod.create({
     dir, bot, log: (m) => logs.push(m),
     notifyEmergency: (rec) => { alerts.push(rec); return Promise.resolve({ ok: true }); },
-    maxFeeBps: bot === 'v2' ? 50 : 0,
+    maxFeeBps: 0,   // v2 fee removed 24 Nov 2026: both bots 0
   });
   return { h, logs, alerts };
 }

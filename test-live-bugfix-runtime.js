@@ -33,6 +33,9 @@ function world(o = {}) {
     send: async () => {}, Transaction: class { add() { return this; } }, createCloseAccountInstruction: () => ({}),
     slBlacklist: { isStopLoss: () => false, add: () => false }, liveRowBins: () => null, liveNotifyClose: () => {},
     liveUsdcBal: async () => 0, onchainQuoteDeposit: async () => o.onchainQuote ?? null, bookOnchainDeposit: (p, d, r, x) => require('./live-open-exec').bookOnchainDeposit(p, d, r, x),
+    // Item 1 halt wiring: the close path records every close in the halt accounting. A recording stub keeps the sandbox chain-free.
+    halt: { recordClose: (ev) => { (o.haltCloses = o.haltCloses || []).push(ev); return { trips: [] }; }, trip: () => {}, lastSolUsdPx: () => 200, checkFeeBps: () => ({ ok: true }) },
+    swapRoute: { ROUTE_FEE_BPS: 0 },
     emptyLivePositionCleanup: async () => true, fetchPool: async () => ({ name: 'ADOPT-SOL', tvl: 50000 }), strategy: { snapshot: () => ({ snap: 1 }) },
     DLMM: { create: async () => o.dlmm, getAllLbPairPositionsByUser: async () => { if (o.onchainMap === 'throw') throw new Error('getProgramAccounts disabled'); return o.onchainMap || new Map(); } },
   };

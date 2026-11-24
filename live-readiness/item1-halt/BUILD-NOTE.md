@@ -1,5 +1,14 @@
 # Item 1 — Build Note: per-book safety-halt enforcement in code
 
+> **Install status — `fix/live-readiness` branch (24 Nov 2026, review fix).**
+> The Item 1 wiring is now APPLIED in the tree (`bot.js`, `live-reshape-exec.js`,
+> `paper-settings.js`). Do not apply the patches again. The creation patches for
+> `live-halt.js` and `halt-params.json` were removed: these files were already in
+> the tree, and `patch` appended a second copy (exit 0), so `live-halt.js` failed
+> with `SyntaxError: Identifier 'fs' has already been declared`. `maxFeeBps` is 0
+> for both bots (v2 fee removed). The Item 1 <-> Item 4a `bot.js` hand-merge (N3)
+> is still open: the Item 4a diffs were not applied.
+
 **Track:** Warlock Live System-Readiness, Item 1 (plan §3) · **Built:** 2026-11-24
 **Bases (read-only SSH, exact trees):** v1 `~/DLMM/audit/repo/sol-lp-bot`
 (`bot.js` 2,520 lines); v2 `~/apps/warlock-v2` at commit `6c3ae78`

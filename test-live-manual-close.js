@@ -30,7 +30,7 @@ const t = async (n, fn) => { await fn(); ok++; console.log('ok', n); };
     const src = fs.readFileSync(path.join(__dirname, 'bot.js'), 'utf8');
     assert.ok(src.includes('manualOpen: !CFG.PAPER, manualClose: !CFG.PAPER'));
     const iDecision = src.indexOf("log('exit decision error (position held, retry next poll): '"), iManual = src.indexOf("if (takeManualClose(state.position) && (!exitReason || exitReason === 'oor_right_reposition')) exitReason = 'manual_close';");
-    const iRepo = src.indexOf("if (exitReason === 'oor_right_reposition') {", iDecision), iClose = src.indexOf('if (exitReason) await liveClose(state, exitReason);');
+    const iRepo = src.indexOf("if (exitReason === 'oor_right_reposition') {", iDecision), iClose = src.indexOf('if (exitReason) await liveClose(state, exitReason');   // Item 1 adds a valuation option to this call
     assert.ok(iDecision > 0 && iManual > iDecision && iManual < iRepo && iRepo < iClose, 'after the exit decision, before reposition/reshape, closed by liveClose');
     const body = src.slice(src.indexOf('function takeManualClose('), src.indexOf('async function liveManualOpen('));
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lmc-bot-')), logs = [];
